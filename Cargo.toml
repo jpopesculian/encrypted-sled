@@ -1,0 +1,12 @@
+[package]
+name = "encrypted-sled"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+bitflags = "1.2.1"
+cipher = "0.3.0"
+sled = "0.34.6"
+
+[dev-dependencies]
+chacha20 = "0.7.2"
