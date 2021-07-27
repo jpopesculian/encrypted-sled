@@ -4,11 +4,16 @@ extern crate bitflags;
 use cipher::generic_array;
 use cipher::{CipherKey, NewCipher, Nonce, StreamCipher};
 use core::fmt;
+use core::future::Future;
 use core::marker::PhantomData;
 use core::ops;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use core::time::Duration;
 use generic_array::typenum;
 use generic_array::GenericArray;
 use std::path::Path;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use typenum::Unsigned;
 
@@ -30,7 +35,6 @@ impl Default for EncryptionMode {
     }
 }
 
-#[derive(Clone)]
 pub struct EncryptionCipher<C>
 where
     C: StreamCipher + NewCipher,
@@ -80,6 +84,20 @@ where
             self.cipher().apply_keystream(&mut data);
         }
         data
+    }
+}
+
+impl<C> Clone for EncryptionCipher<C>
+where
+    C: StreamCipher + NewCipher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            cipher: self.cipher,
+            key: self.key.clone(),
+            nonce: self.nonce.clone(),
+            mode: self.mode,
+        }
     }
 }
 
@@ -189,6 +207,28 @@ pub trait Encryption {
             return data;
         }
         self.decrypt(data, EncryptionMode::TREE_NAME)
+    }
+    fn encrypt_event(&self, event: Event) -> Event {
+        match event {
+            Event::Insert { key, value } => Event::Insert {
+                key: self.encrypt(key, EncryptionMode::KEY),
+                value: self.encrypt(value, EncryptionMode::VALUE),
+            },
+            Event::Remove { key } => Event::Remove {
+                key: self.encrypt(key, EncryptionMode::KEY),
+            },
+        }
+    }
+    fn decrypt_event(&self, event: Event) -> Event {
+        match event {
+            Event::Insert { key, value } => Event::Insert {
+                key: self.decrypt(key, EncryptionMode::KEY),
+                value: self.decrypt(value, EncryptionMode::VALUE),
+            },
+            Event::Remove { key } => Event::Remove {
+                key: self.decrypt(key, EncryptionMode::KEY),
+            },
+        }
     }
 }
 
@@ -301,15 +341,9 @@ where
     config_fn!(print_profile_on_drop, bool);
 }
 
-#[derive(Debug, Clone)]
-enum BatchCommand {
-    Insert(IVec, IVec),
-    Remove(IVec),
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Batch {
-    commands: Vec<BatchCommand>,
+    events: Vec<Event>,
 }
 
 impl Batch {
@@ -318,24 +352,23 @@ impl Batch {
         K: Into<IVec>,
         V: Into<IVec>,
     {
-        self.commands
-            .push(BatchCommand::Insert(key.into(), value.into()))
+        self.events.push(Event::Insert {
+            key: key.into(),
+            value: value.into(),
+        })
     }
     pub fn remove<K>(&mut self, key: K)
     where
         K: Into<IVec>,
     {
-        self.commands.push(BatchCommand::Remove(key.into()))
+        self.events.push(Event::Remove { key: key.into() })
     }
     fn to_encrypted<E: Encryption>(self, encryption: &E) -> sled::Batch {
         let mut batch = sled::Batch::default();
-        for command in self.commands {
-            match command {
-                BatchCommand::Insert(k, v) => batch.insert(
-                    encryption.encrypt_key_ivec(k),
-                    encryption.encrypt_value_ivec(v),
-                ),
-                BatchCommand::Remove(k) => batch.remove(encryption.encrypt_key_ivec(k)),
+        for event in self.events {
+            match encryption.encrypt_event(event) {
+                Event::Insert { key, value } => batch.insert(key, value),
+                Event::Remove { key } => batch.remove(key),
             }
         }
         batch
@@ -444,6 +477,56 @@ where
     }
 }
 
+pub struct Subscriber<E> {
+    inner: sled::Subscriber,
+    encryption: Arc<E>,
+}
+
+impl<E> Subscriber<E> {
+    pub(crate) fn new(inner: sled::Subscriber, encryption: Arc<E>) -> Self {
+        Self { inner, encryption }
+    }
+    fn pin_get_inner(self: Pin<&mut Self>) -> Pin<&mut sled::Subscriber> {
+        unsafe { self.map_unchecked_mut(|s| &mut s.inner) }
+    }
+}
+
+impl<E> Subscriber<E>
+where
+    E: Encryption,
+{
+    pub fn next_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+        self.inner
+            .next_timeout(timeout)
+            .map(|event| self.encryption.decrypt_event(event))
+    }
+}
+
+impl<E> Future for Subscriber<E>
+where
+    E: Encryption,
+{
+    type Output = Option<Event>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let encryption = self.encryption.clone();
+        self.pin_get_inner()
+            .poll(cx)
+            .map(|event| event.map(|event| encryption.decrypt_event(event)))
+    }
+}
+
+impl<E> Iterator for Subscriber<E>
+where
+    E: Encryption,
+{
+    type Item = Event;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|event| self.encryption.decrypt_event(event))
+    }
+}
+
 impl<E> Tree<E>
 where
     E: Encryption,
@@ -458,8 +541,6 @@ where
             self.encryption.encrypt_value_ivec(value),
         ))
     }
-
-    // TODO implement watch_prefix
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
         self.encryption
@@ -483,6 +564,14 @@ where
                 self.encryption.clone(),
             ))
         })
+    }
+
+    pub fn watch_prefix<P: AsRef<[u8]>>(&self, prefix: P) -> Subscriber<E> {
+        Subscriber::new(
+            self.inner
+                .watch_prefix(self.encryption.encrypt_key_ref(prefix)),
+            self.encryption.clone(),
+        )
     }
 
     pub fn apply_batch(&self, batch: Batch) -> Result<()> {
@@ -951,6 +1040,23 @@ mod tests {
                     Ok((IVec::from(&[3]), IVec::from(&[30])))
                 ]
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn subscribe() -> Result<()> {
+        for_all_dbs(|db| {
+            let subscriber = db.watch_prefix(vec![]);
+
+            let _ = std::thread::spawn(move || db.insert(vec![0], vec![1]));
+
+            for event in subscriber.take(1) {
+                match event {
+                    sled::Event::Insert { key, .. } => assert_eq!(key.as_ref(), &[0]),
+                    sled::Event::Remove { .. } => {}
+                }
+            }
             Ok(())
         })
     }
