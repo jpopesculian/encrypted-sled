@@ -8,10 +8,11 @@ use core::marker::PhantomData;
 use core::ops;
 use generic_array::typenum;
 use generic_array::GenericArray;
-use sled::IVec;
 use std::path::Path;
 use std::sync::Arc;
 use typenum::Unsigned;
+
+pub use sled::{CompareAndSwapError, Error, Event, IVec, MergeOperator, Mode};
 
 pub type Result<T, E = sled::Error> = std::result::Result<T, E>;
 
@@ -147,8 +148,21 @@ pub trait Encryption {
     fn decrypt_value_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
         self.decrypt_ivec(data, EncryptionMode::VALUE)
     }
-    fn decrypt_value_result(&self, res: Result<Option<IVec>>) -> Result<Option<IVec>> {
+    fn decrypt_value_result<E>(&self, res: Result<Option<IVec>, E>) -> Result<Option<IVec>, E> {
         res.map(|val| val.map(|val| self.decrypt(val, EncryptionMode::VALUE)))
+    }
+    fn decrypt_key_value_result(
+        &self,
+        res: Result<Option<(IVec, IVec)>>,
+    ) -> Result<Option<(IVec, IVec)>> {
+        res.map(|val| {
+            val.map(|(key, val)| {
+                (
+                    self.decrypt(key, EncryptionMode::KEY),
+                    self.decrypt(val, EncryptionMode::VALUE),
+                )
+            })
+        })
     }
     fn encrypt_tree_name_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
         if data.as_ref() == DEFAULT_TREE_NAME {
@@ -210,7 +224,7 @@ pub struct Tree<E> {
 }
 
 impl<E> Tree<E> {
-    fn new(inner: sled::Tree, encryption: Arc<E>) -> Self {
+    pub(crate) fn new(inner: sled::Tree, encryption: Arc<E>) -> Self {
         Self { inner, encryption }
     }
 }
@@ -223,7 +237,7 @@ pub struct Db<E> {
 }
 
 impl<E> Db<E> {
-    fn new(inner: sled::Db, encryption: Arc<E>) -> Self {
+    pub(crate) fn new(inner: sled::Db, encryption: Arc<E>) -> Self {
         let tree = Tree::new(sled::Tree::clone(&inner), encryption.clone());
         Self {
             inner,
@@ -287,6 +301,47 @@ where
     config_fn!(print_profile_on_drop, bool);
 }
 
+#[derive(Debug, Clone)]
+enum BatchCommand {
+    Insert(IVec, IVec),
+    Remove(IVec),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Batch {
+    commands: Vec<BatchCommand>,
+}
+
+impl Batch {
+    pub fn insert<K, V>(&mut self, key: K, value: V)
+    where
+        K: Into<IVec>,
+        V: Into<IVec>,
+    {
+        self.commands
+            .push(BatchCommand::Insert(key.into(), value.into()))
+    }
+    pub fn remove<K>(&mut self, key: K)
+    where
+        K: Into<IVec>,
+    {
+        self.commands.push(BatchCommand::Remove(key.into()))
+    }
+    fn to_encrypted<E: Encryption>(self, encryption: &E) -> sled::Batch {
+        let mut batch = sled::Batch::default();
+        for command in self.commands {
+            match command {
+                BatchCommand::Insert(k, v) => batch.insert(
+                    encryption.encrypt_key_ivec(k),
+                    encryption.encrypt_value_ivec(v),
+                ),
+                BatchCommand::Remove(k) => batch.remove(encryption.encrypt_key_ivec(k)),
+            }
+        }
+        batch
+    }
+}
+
 impl<E> Db<E>
 where
     E: Encryption,
@@ -327,6 +382,68 @@ where
     // TODO implement export and import
 }
 
+pub struct Iter<E> {
+    inner: sled::Iter,
+    encryption: Arc<E>,
+}
+
+impl<E> Iter<E> {
+    pub(crate) fn new(inner: sled::Iter, encryption: Arc<E>) -> Self {
+        Self { inner, encryption }
+    }
+}
+
+impl<E> Iter<E>
+where
+    E: Encryption + Send + Sync,
+{
+    pub fn keys(self) -> impl DoubleEndedIterator<Item = Result<IVec>> + Send + Sync {
+        let encryption = self.encryption;
+        self.inner
+            .keys()
+            .map(move |key_res| key_res.map(|key| encryption.decrypt_key_ivec(key)))
+    }
+    pub fn values(self) -> impl DoubleEndedIterator<Item = Result<IVec>> + Send + Sync {
+        let encryption = self.encryption;
+        self.inner
+            .values()
+            .map(move |key_res| key_res.map(|key| encryption.decrypt_value_ivec(key)))
+    }
+}
+
+impl<E> Iterator for Iter<E>
+where
+    E: Encryption,
+{
+    type Item = Result<(IVec, IVec)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|res| {
+            res.map(|(k, v)| {
+                (
+                    self.encryption.decrypt_key_ivec(k),
+                    self.encryption.decrypt_value_ivec(v),
+                )
+            })
+        })
+    }
+}
+
+impl<E> DoubleEndedIterator for Iter<E>
+where
+    E: Encryption,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|res| {
+            res.map(|(k, v)| {
+                (
+                    self.encryption.decrypt_key_ivec(k),
+                    self.encryption.decrypt_value_ivec(v),
+                )
+            })
+        })
+    }
+}
+
 impl<E> Tree<E>
 where
     E: Encryption,
@@ -342,8 +459,7 @@ where
         ))
     }
 
-    // TODO implement transaction
-    // TODO implement batch
+    // TODO implement watch_prefix
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
         self.encryption
@@ -355,22 +471,47 @@ where
             .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key_ref(key)))
     }
 
+    pub fn transaction<F, A, Error>(&self, f: F) -> transaction::TransactionResult<A, Error>
+    where
+        F: Fn(
+            &transaction::TransactionalTree<E>,
+        ) -> transaction::ConflictableTransactionResult<A, Error>,
+    {
+        self.inner.transaction(|tree| {
+            f(&transaction::TransactionalTree::new(
+                tree.clone(),
+                self.encryption.clone(),
+            ))
+        })
+    }
+
+    pub fn apply_batch(&self, batch: Batch) -> Result<()> {
+        self.inner.apply_batch(batch.to_encrypted(&self.encryption))
+    }
+
     pub fn compare_and_swap<K, OV, NV>(
         &self,
         key: K,
         old: Option<OV>,
         new: Option<NV>,
-    ) -> Result<Result<(), sled::CompareAndSwapError>>
+    ) -> Result<Result<(), CompareAndSwapError>>
     where
         K: AsRef<[u8]>,
         OV: AsRef<[u8]>,
         NV: Into<IVec>,
     {
-        self.inner.compare_and_swap(
-            self.encryption.encrypt_key_ref(key),
-            old.map(|val| self.encryption.encrypt_value_ref(val)),
-            new.map(|val| self.encryption.encrypt_value_ivec(val)),
-        )
+        self.inner
+            .compare_and_swap(
+                self.encryption.encrypt_key_ref(key),
+                old.map(|val| self.encryption.encrypt_value_ref(val)),
+                new.map(|val| self.encryption.encrypt_value_ivec(val)),
+            )
+            .map(|res| {
+                res.map_err(|cas| CompareAndSwapError {
+                    current: cas.current.map(|v| self.encryption.decrypt_value_ivec(v)),
+                    proposed: cas.proposed.map(|v| self.encryption.decrypt_value_ivec(v)),
+                })
+            })
     }
 
     pub fn update_and_fetch<K, V, F>(&self, key: K, mut f: F) -> Result<Option<IVec>>
@@ -414,6 +555,192 @@ where
     pub async fn flush_async(&self) -> Result<usize> {
         self.inner.flush_async().await
     }
+
+    pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
+        self.inner
+            .contains_key(self.encryption.encrypt_key_ref(key))
+    }
+
+    pub fn get_lt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.encryption
+            .decrypt_key_value_result(self.inner.get_lt(self.encryption.encrypt_key_ref(key)))
+    }
+
+    pub fn get_gt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.encryption
+            .decrypt_key_value_result(self.inner.get_gt(self.encryption.encrypt_key_ref(key)))
+    }
+
+    pub fn first(&self) -> Result<Option<(IVec, IVec)>> {
+        self.encryption.decrypt_key_value_result(self.inner.first())
+    }
+    pub fn last(&self) -> Result<Option<(IVec, IVec)>> {
+        self.encryption.decrypt_key_value_result(self.inner.last())
+    }
+    pub fn pop_min(&self) -> Result<Option<(IVec, IVec)>> {
+        self.encryption
+            .decrypt_key_value_result(self.inner.pop_min())
+    }
+    pub fn pop_max(&self) -> Result<Option<(IVec, IVec)>> {
+        self.encryption
+            .decrypt_key_value_result(self.inner.pop_max())
+    }
+
+    pub fn iter(&self) -> Iter<E> {
+        Iter::new(self.inner.iter(), self.encryption.clone())
+    }
+
+    pub fn range<K, R>(&self, range: R) -> Iter<E>
+    where
+        K: AsRef<[u8]>,
+        R: ops::RangeBounds<K>,
+    {
+        let encrypt_bound = |bound: ops::Bound<&K>| -> ops::Bound<IVec> {
+            match bound {
+                ops::Bound::Unbounded => ops::Bound::Unbounded,
+                ops::Bound::Included(x) => ops::Bound::Included(self.encryption.encrypt_key_ref(x)),
+                ops::Bound::Excluded(x) => ops::Bound::Excluded(self.encryption.encrypt_key_ref(x)),
+            }
+        };
+        let range = (
+            encrypt_bound(range.start_bound()),
+            encrypt_bound(range.end_bound()),
+        );
+        Iter::new(self.inner.range(range), self.encryption.clone())
+    }
+
+    pub fn scan_prefix<P>(&self, prefix: P) -> Iter<E>
+    where
+        P: AsRef<[u8]>,
+    {
+        Iter::new(
+            self.inner
+                .scan_prefix(self.encryption.encrypt_key_ref(prefix)),
+            self.encryption.clone(),
+        )
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    #[inline]
+    pub fn clear(&self) -> Result<()> {
+        self.inner.clear()
+    }
+    pub fn name(&self) -> IVec {
+        self.encryption.decrypt_tree_name_ivec(self.inner.name())
+    }
+    #[inline]
+    pub fn checksum(&self) -> Result<u32> {
+        self.inner.checksum()
+    }
+}
+
+impl<E> Tree<E>
+where
+    E: Encryption + 'static,
+{
+    pub fn merge<K, V>(&self, key: K, value: V) -> Result<Option<IVec>>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.encryption.decrypt_value_result(self.inner.merge(
+            self.encryption.encrypt_key_ref(key),
+            self.encryption.encrypt_value_ref(value),
+        ))
+    }
+
+    pub fn set_merge_operator(&self, merge_operator: impl sled::MergeOperator + 'static) {
+        let encryption = self.encryption.clone();
+        let new_operator = move |key: &[u8], old: Option<&[u8]>, merged: &[u8]| {
+            merge_operator(
+                &encryption.decrypt_key_ref(key),
+                old.map(|v| encryption.decrypt_value_ref(v)).as_deref(),
+                &encryption.decrypt_value_ref(merged),
+            )
+            .map(|v| encryption.encrypt_value_ivec(v).to_vec())
+        };
+        self.inner.set_merge_operator(new_operator);
+    }
+}
+
+pub mod transaction {
+    use super::*;
+    pub use sled::transaction::{
+        abort, ConflictableTransactionError, ConflictableTransactionResult, TransactionError,
+        TransactionResult, UnabortableTransactionError,
+    };
+
+    pub struct TransactionalTree<E> {
+        inner: sled::transaction::TransactionalTree,
+        encryption: Arc<E>,
+    }
+
+    impl<E> TransactionalTree<E>
+    where
+        E: Encryption,
+    {
+        pub(crate) fn new(inner: sled::transaction::TransactionalTree, encryption: Arc<E>) -> Self {
+            Self { inner, encryption }
+        }
+        pub fn insert<K, V>(
+            &self,
+            key: K,
+            value: V,
+        ) -> Result<Option<IVec>, UnabortableTransactionError>
+        where
+            K: AsRef<[u8]>,
+            V: Into<IVec>,
+        {
+            self.encryption.decrypt_value_result(self.inner.insert(
+                self.encryption.encrypt_key_ref(key),
+                self.encryption.encrypt_value_ivec(value),
+            ))
+        }
+
+        pub fn get<K: AsRef<[u8]>>(
+            &self,
+            key: K,
+        ) -> Result<Option<IVec>, UnabortableTransactionError> {
+            self.encryption
+                .decrypt_value_result(self.inner.get(self.encryption.encrypt_key_ref(key)))
+        }
+
+        pub fn remove<K: AsRef<[u8]>>(
+            &self,
+            key: K,
+        ) -> Result<Option<IVec>, UnabortableTransactionError> {
+            self.encryption
+                .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key_ref(key)))
+        }
+
+        pub fn apply_batch(&self, batch: Batch) -> Result<(), UnabortableTransactionError> {
+            self.inner
+                .apply_batch(&batch.to_encrypted(&self.encryption))
+        }
+
+        #[inline]
+        pub fn flush(&self) {
+            self.inner.flush()
+        }
+
+        #[inline]
+        pub fn generate_id(&self) -> Result<u64> {
+            self.inner.generate_id()
+        }
+    }
 }
 
 pub fn open<P: AsRef<Path>, E: Encryption>(path: P, encryption: E) -> Result<Db<E>> {
@@ -425,17 +752,40 @@ mod tests {
     use super::*;
     use chacha20::ChaCha20;
 
+    type TestCipher = EncryptionCipher<ChaCha20>;
+    type TestDb = Db<TestCipher>;
+
     const ENCRYPTION_KEY: &[u8] = b"an example very very secret key.";
     const ENCRYPTION_NONCE: &[u8] = b"secret nonce";
 
-    fn temp_db(mode: EncryptionMode) -> Db<EncryptionCipher<ChaCha20>> {
-        Config::new(
-            EncryptionCipher::<ChaCha20>::new_from_slices(ENCRYPTION_KEY, ENCRYPTION_NONCE, mode)
-                .unwrap(),
-        )
-        .temporary(true)
-        .open()
-        .unwrap()
+    fn test_cipher(mode: EncryptionMode) -> TestCipher {
+        EncryptionCipher::new_from_slices(ENCRYPTION_KEY, ENCRYPTION_NONCE, mode).unwrap()
+    }
+
+    fn temp_db(mode: EncryptionMode) -> TestDb {
+        println!("opening test db with: {:?}", mode);
+        Config::new(test_cipher(mode))
+            .temporary(true)
+            .open()
+            .unwrap()
+    }
+
+    fn for_all_dbs<F>(f: F) -> Result<()>
+    where
+        F: Fn(TestDb) -> Result<()>,
+    {
+        for mode in &[
+            EncryptionMode::KEY,
+            EncryptionMode::VALUE,
+            EncryptionMode::TREE_NAME,
+            EncryptionMode::KEY | EncryptionMode::VALUE,
+            EncryptionMode::KEY | EncryptionMode::TREE_NAME,
+            EncryptionMode::VALUE | EncryptionMode::TREE_NAME,
+            EncryptionMode::KEY | EncryptionMode::VALUE | EncryptionMode::TREE_NAME,
+        ] {
+            f(temp_db(*mode))?
+        }
+        Ok(())
     }
 
     fn str_res(res: Result<Option<IVec>>) -> Result<Option<String>> {
@@ -443,15 +793,18 @@ mod tests {
     }
 
     #[test]
-    fn insert() {
-        let db = temp_db(EncryptionMode::all());
-        let tree = db.open_tree("hello").unwrap();
-        tree.insert("hello", "hi").unwrap();
-        assert_eq!(Ok(Some("hi".to_string())), str_res(tree.get("hello")));
-        assert_eq!(Ok(None), str_res(tree.inner.get("hello")));
-        tree.remove("hello").unwrap();
-        assert_eq!(Ok(None), str_res(tree.get("hello")));
-        assert_eq!(Ok(None), str_res(tree.inner.get("hello")));
+    fn insert() -> Result<()> {
+        for_all_dbs(|db| {
+            let tree = db.open_tree("hello").unwrap();
+            assert!(!tree.contains_key("hello").unwrap());
+            tree.insert("hello", "hi").unwrap();
+            assert!(tree.contains_key("hello").unwrap());
+            assert_eq!(Ok(Some("hi".to_string())), str_res(tree.get("hello")));
+            tree.remove("hello").unwrap();
+            assert!(!tree.contains_key("hello").unwrap());
+            assert_eq!(Ok(None), str_res(tree.get("hello")));
+            Ok(())
+        })
     }
 
     fn u64_to_ivec(number: u64) -> IVec {
@@ -473,31 +826,132 @@ mod tests {
     }
 
     #[test]
-    fn update_and_fetch() {
-        let db = temp_db(EncryptionMode::all());
+    fn update_and_fetch() -> Result<()> {
+        for_all_dbs(|db| {
+            let zero = u64_to_ivec(0);
+            let one = u64_to_ivec(1);
+            let two = u64_to_ivec(2);
+            let three = u64_to_ivec(3);
 
-        let zero = u64_to_ivec(0);
-        let one = u64_to_ivec(1);
-        let two = u64_to_ivec(2);
-        let three = u64_to_ivec(3);
-
-        assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(zero)));
-        assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(one)));
-        assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(two)));
-        assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(three)));
+            assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(zero)));
+            assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(one)));
+            assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(two)));
+            assert_eq!(db.update_and_fetch("counter", increment), Ok(Some(three)));
+            Ok(())
+        })
     }
 
     #[test]
-    fn fetch_and_update() {
-        let db = temp_db(EncryptionMode::all());
+    fn fetch_and_update() -> Result<()> {
+        for_all_dbs(|db| {
+            let zero = u64_to_ivec(0);
+            let one = u64_to_ivec(1);
+            let two = u64_to_ivec(2);
 
-        let zero = u64_to_ivec(0);
-        let one = u64_to_ivec(1);
-        let two = u64_to_ivec(2);
+            assert_eq!(db.fetch_and_update("counter", increment), Ok(None));
+            assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(zero)));
+            assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(one)));
+            assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(two)));
+            Ok(())
+        })
+    }
 
-        assert_eq!(db.fetch_and_update("counter", increment), Ok(None));
-        assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(zero)));
-        assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(one)));
-        assert_eq!(db.fetch_and_update("counter", increment), Ok(Some(two)));
+    #[test]
+    fn merge() -> Result<()> {
+        fn concatenate_merge(
+            _key: &[u8],              // the key being merged
+            old_value: Option<&[u8]>, // the previous value, if one existed
+            merged_bytes: &[u8],      // the new bytes being merged in
+        ) -> Option<Vec<u8>> {
+            // set the new value, return None to delete
+            let mut ret = old_value.map(|ov| ov.to_vec()).unwrap_or_else(|| vec![]);
+
+            ret.extend_from_slice(merged_bytes);
+
+            Some(ret)
+        }
+
+        for_all_dbs(|tree| {
+            tree.set_merge_operator(concatenate_merge);
+
+            let k = b"k1";
+
+            tree.insert(k, vec![0]).unwrap();
+            tree.merge(k, vec![1]).unwrap();
+            tree.merge(k, vec![2]).unwrap();
+            assert_eq!(tree.get(k), Ok(Some(IVec::from(vec![0, 1, 2]))));
+
+            // Replace previously merged data. The merge function will not be called.
+            tree.insert(k, vec![3]).unwrap();
+            assert_eq!(tree.get(k), Ok(Some(IVec::from(vec![3]))));
+
+            // Merges on non-present values will cause the merge function to be called
+            // with `old_value == None`. If the merge function returns something (which it
+            // does, in this case) a new value will be inserted.
+            tree.remove(k).unwrap();
+            tree.merge(k, vec![4]).unwrap();
+            assert_eq!(tree.get(k), Ok(Some(IVec::from(vec![4]))));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn batch() -> Result<()> {
+        for_all_dbs(|db| {
+            let mut batch = Batch::default();
+            batch.insert("key_a", "val_a");
+            batch.insert("key_b", "val_b");
+            batch.insert("key_c", "val_c");
+            batch.remove("key_0");
+
+            db.apply_batch(batch)?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn transaction_err() -> Result<()> {
+        #[derive(Debug, PartialEq)]
+        struct MyBullshitError;
+
+        for_all_dbs(|db| {
+            // Use write-only transactions as a writebatch:
+            let res = db
+                .transaction(|tx_db| {
+                    tx_db.insert(b"k1", b"cats")?;
+                    tx_db.insert(b"k2", b"dogs")?;
+                    // aborting will cause all writes to roll-back.
+                    if true {
+                        transaction::abort(MyBullshitError)?;
+                    }
+                    Ok(42)
+                })
+                .unwrap_err();
+
+            assert_eq!(res, transaction::TransactionError::Abort(MyBullshitError));
+            assert_eq!(db.get(b"k1")?, None);
+            assert_eq!(db.get(b"k2")?, None);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn iter() -> Result<()> {
+        for_all_dbs(|db| {
+            db.insert(&[1], vec![10])?;
+            db.insert(&[2], vec![20])?;
+            db.insert(&[3], vec![30])?;
+            let mut out = db.iter().collect::<Vec<Result<(IVec, IVec)>>>();
+            out.sort_by_key(|res| res.clone().unwrap());
+            assert_eq!(
+                &out,
+                &[
+                    Ok((IVec::from(&[1]), IVec::from(&[10]))),
+                    Ok((IVec::from(&[2]), IVec::from(&[20]))),
+                    Ok((IVec::from(&[3]), IVec::from(&[30])))
+                ]
+            );
+            Ok(())
+        })
     }
 }
