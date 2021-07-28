@@ -1,3 +1,55 @@
+//! `encrypted-sled` is a drop in replacement / wrapper around the amazing
+//! [`sled`](https://crates.io/crates/sled) embedded database. Just configure with an encryption
+//! and use normally.
+//!
+//! # Examples
+//!
+//! ```
+//! # let _ = std::fs::remove_dir_all("my_db");
+//! let cipher = encrypted_sled::EncryptionCipher::<chacha20::ChaCha20>::new_from_slices(
+//!     b"an example very very secret key.",
+//!     b"secret nonce",
+//!     encrypted_sled::EncryptionMode::default(),
+//! )
+//! .unwrap();
+//! let db = encrypted_sled::open("my_db", cipher).unwrap();
+//!
+//! // insert and get
+//! db.insert(b"yo!", b"v1");
+//! assert_eq!(&db.get(b"yo!").unwrap().unwrap(), b"v1");
+//!
+//! // Atomic compare-and-swap.
+//! db.compare_and_swap(
+//!     b"yo!",      // key
+//!     Some(b"v1"), // old value, None for not present
+//!     Some(b"v2"), // new value, None for delete
+//! )
+//! .unwrap();
+//!
+//! // Iterates over key-value pairs, starting at the given key.
+//! let scan_key: &[u8] = b"a non-present key before yo!";
+//! let mut iter = db.range(scan_key..);
+//! assert_eq!(&iter.next().unwrap().unwrap().0, b"yo!");
+//! assert_eq!(iter.next(), None);
+//!
+//! db.remove(b"yo!");
+//! assert_eq!(db.get(b"yo!"), Ok(None));
+//!
+//! let other_tree = db.open_tree(b"cool db facts").unwrap();
+//! other_tree.insert(
+//!     b"k1",
+//!     &b"a Db acts like a Tree due to implementing Deref<Target = Tree>"[..]
+//! ).unwrap();
+//! # let _ = std::fs::remove_dir_all("my_db");
+//! ```
+//!
+//! # Todos
+//!
+//! A few things are still not implemented:
+//!
+//! * `TransactionalTrees` (e.g. performing a transaction on multiple trees at the same time)
+//! * Database import/export
+
 #[macro_use]
 extern crate bitflags;
 
@@ -116,119 +168,86 @@ where
 const DEFAULT_TREE_NAME: &[u8] = b"__sled__default";
 
 pub trait Encryption {
-    fn encrypt(&self, data: IVec, mode: EncryptionMode) -> IVec;
-    fn decrypt(&self, data: IVec, mode: EncryptionMode) -> IVec;
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec;
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec;
     #[inline]
-    fn encrypt_ref<T: AsRef<[u8]>>(&self, data: T, mode: EncryptionMode) -> IVec {
-        self.encrypt(data.as_ref().into(), mode)
-    }
-    #[inline]
-    fn encrypt_ivec<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
-        self.encrypt(data.into(), mode)
+    fn encrypt<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
+        self.encrypt_ivec(data.into(), mode)
     }
     #[inline]
-    fn decrypt_ref<T: AsRef<[u8]>>(&self, data: T, mode: EncryptionMode) -> IVec {
-        self.decrypt(data.as_ref().into(), mode)
+    fn decrypt<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
+        self.decrypt_ivec(data.into(), mode)
     }
     #[inline]
-    fn decrypt_ivec<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
-        self.decrypt(data.into(), mode)
+    fn encrypt_key<T: Into<IVec>>(&self, data: T) -> IVec {
+        self.encrypt(data, EncryptionMode::KEY)
     }
     #[inline]
-    fn encrypt_key_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        self.encrypt_ref(data, EncryptionMode::KEY)
+    fn decrypt_key<T: Into<IVec>>(&self, data: T) -> IVec {
+        self.decrypt(data, EncryptionMode::KEY)
     }
     #[inline]
-    fn encrypt_key_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.encrypt_ivec(data, EncryptionMode::KEY)
+    fn encrypt_value<T: Into<IVec>>(&self, data: T) -> IVec {
+        self.encrypt(data, EncryptionMode::VALUE)
     }
     #[inline]
-    fn decrypt_key_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        self.decrypt_ref(data, EncryptionMode::KEY)
+    fn decrypt_value<T: Into<IVec>>(&self, data: T) -> IVec {
+        self.decrypt(data, EncryptionMode::VALUE)
     }
-    #[inline]
-    fn decrypt_key_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.decrypt_ivec(data, EncryptionMode::KEY)
-    }
-    #[inline]
-    fn encrypt_value_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        self.encrypt_ref(data, EncryptionMode::VALUE)
-    }
-    #[inline]
-    fn encrypt_value_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.encrypt_ivec(data, EncryptionMode::VALUE)
-    }
-    #[inline]
-    fn decrypt_value_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        self.decrypt_ref(data, EncryptionMode::VALUE)
-    }
-    #[inline]
-    fn decrypt_value_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.decrypt_ivec(data, EncryptionMode::VALUE)
-    }
-    fn decrypt_value_result<E>(&self, res: Result<Option<IVec>, E>) -> Result<Option<IVec>, E> {
-        res.map(|val| val.map(|val| self.decrypt(val, EncryptionMode::VALUE)))
-    }
-    fn decrypt_key_value_result(
-        &self,
-        res: Result<Option<(IVec, IVec)>>,
-    ) -> Result<Option<(IVec, IVec)>> {
-        res.map(|val| {
-            val.map(|(key, val)| {
-                (
-                    self.decrypt(key, EncryptionMode::KEY),
-                    self.decrypt(val, EncryptionMode::VALUE),
-                )
-            })
-        })
-    }
-    fn encrypt_tree_name_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        if data.as_ref() == DEFAULT_TREE_NAME {
-            return data.as_ref().into();
-        }
-        self.encrypt_ref(data, EncryptionMode::TREE_NAME)
-    }
-    fn encrypt_tree_name_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn encrypt_tree_name<T: Into<IVec>>(&self, data: T) -> IVec {
         let data = data.into();
         if data == DEFAULT_TREE_NAME {
             return data;
         }
         self.encrypt(data, EncryptionMode::TREE_NAME)
     }
-    fn decrypt_tree_name_ref<T: AsRef<[u8]>>(&self, data: T) -> IVec {
-        if data.as_ref() == DEFAULT_TREE_NAME {
-            return data.as_ref().into();
-        }
-        self.decrypt_ref(data, EncryptionMode::TREE_NAME)
-    }
-    fn decrypt_tree_name_ivec<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn decrypt_tree_name<T: Into<IVec>>(&self, data: T) -> IVec {
         let data = data.into();
         if data == DEFAULT_TREE_NAME {
             return data;
         }
         self.decrypt(data, EncryptionMode::TREE_NAME)
     }
+    fn decrypt_value_result<E>(&self, res: Result<Option<IVec>, E>) -> Result<Option<IVec>, E> {
+        res.map(|val| val.map(|val| self.decrypt_value(val)))
+    }
+    fn decrypt_key_value_result(
+        &self,
+        res: Result<Option<(IVec, IVec)>>,
+    ) -> Result<Option<(IVec, IVec)>> {
+        res.map(|val| val.map(|(key, val)| (self.decrypt_key(key), self.decrypt_value(val))))
+    }
     fn encrypt_event(&self, event: Event) -> Event {
         match event {
             Event::Insert { key, value } => Event::Insert {
-                key: self.encrypt(key, EncryptionMode::KEY),
-                value: self.encrypt(value, EncryptionMode::VALUE),
+                key: self.encrypt_key(key),
+                value: self.encrypt_value(value),
             },
             Event::Remove { key } => Event::Remove {
-                key: self.encrypt(key, EncryptionMode::KEY),
+                key: self.encrypt_key(key),
             },
         }
     }
     fn decrypt_event(&self, event: Event) -> Event {
         match event {
             Event::Insert { key, value } => Event::Insert {
-                key: self.decrypt(key, EncryptionMode::KEY),
-                value: self.decrypt(value, EncryptionMode::VALUE),
+                key: self.decrypt_key(key),
+                value: self.decrypt_value(value),
             },
             Event::Remove { key } => Event::Remove {
-                key: self.decrypt(key, EncryptionMode::KEY),
+                key: self.decrypt_key(key),
             },
         }
+    }
+    fn encrypt_batch(&self, batch: Batch) -> sled::Batch {
+        let mut encrypted = sled::Batch::default();
+        for event in batch.events {
+            match self.encrypt_event(event) {
+                Event::Insert { key, value } => encrypted.insert(key, value),
+                Event::Remove { key } => encrypted.remove(key),
+            }
+        }
+        encrypted
     }
 }
 
@@ -237,10 +256,10 @@ where
     T: ops::Deref,
     T::Target: Encryption,
 {
-    fn encrypt(&self, data: IVec, mode: EncryptionMode) -> IVec {
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
         self.deref().encrypt(data, mode)
     }
-    fn decrypt(&self, data: IVec, mode: EncryptionMode) -> IVec {
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
         self.deref().decrypt(data, mode)
     }
 }
@@ -249,10 +268,10 @@ impl<C> Encryption for EncryptionCipher<C>
 where
     C: StreamCipher + NewCipher,
 {
-    fn encrypt(&self, data: IVec, mode: EncryptionMode) -> IVec {
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
         self.apply_to_data(data, mode)
     }
-    fn decrypt(&self, data: IVec, mode: EncryptionMode) -> IVec {
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
         self.apply_to_data(data, mode)
     }
 }
@@ -363,16 +382,6 @@ impl Batch {
     {
         self.events.push(Event::Remove { key: key.into() })
     }
-    fn to_encrypted<E: Encryption>(self, encryption: &E) -> sled::Batch {
-        let mut batch = sled::Batch::default();
-        for event in self.events {
-            match encryption.encrypt_event(event) {
-                Event::Insert { key, value } => batch.insert(key, value),
-                Event::Remove { key } => batch.remove(key),
-            }
-        }
-        batch
-    }
 }
 
 impl<E> Db<E>
@@ -381,18 +390,18 @@ where
 {
     pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<Tree<E>> {
         self.inner
-            .open_tree(self.encryption.encrypt_tree_name_ref(name))
+            .open_tree(self.encryption.encrypt_tree_name(name.as_ref()))
             .map(|tree| Tree::new(tree, self.encryption.clone()))
     }
     pub fn drop_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<bool> {
         self.inner
-            .drop_tree(self.encryption.encrypt_tree_name_ref(name))
+            .drop_tree(self.encryption.encrypt_tree_name(name.as_ref()))
     }
     pub fn tree_names(&self) -> Vec<IVec> {
         self.inner
             .tree_names()
             .into_iter()
-            .map(|name| self.encryption.decrypt_tree_name_ivec(name))
+            .map(|name| self.encryption.decrypt_tree_name(name))
             .collect()
     }
     #[inline]
@@ -434,13 +443,13 @@ where
         let encryption = self.encryption;
         self.inner
             .keys()
-            .map(move |key_res| key_res.map(|key| encryption.decrypt_key_ivec(key)))
+            .map(move |key_res| key_res.map(|key| encryption.decrypt_key(key)))
     }
     pub fn values(self) -> impl DoubleEndedIterator<Item = Result<IVec>> + Send + Sync {
         let encryption = self.encryption;
         self.inner
             .values()
-            .map(move |key_res| key_res.map(|key| encryption.decrypt_value_ivec(key)))
+            .map(move |key_res| key_res.map(|key| encryption.decrypt_value(key)))
     }
 }
 
@@ -453,8 +462,8 @@ where
         self.inner.next().map(|res| {
             res.map(|(k, v)| {
                 (
-                    self.encryption.decrypt_key_ivec(k),
-                    self.encryption.decrypt_value_ivec(v),
+                    self.encryption.decrypt_key(k),
+                    self.encryption.decrypt_value(v),
                 )
             })
         })
@@ -469,8 +478,8 @@ where
         self.inner.next_back().map(|res| {
             res.map(|(k, v)| {
                 (
-                    self.encryption.decrypt_key_ivec(k),
-                    self.encryption.decrypt_value_ivec(v),
+                    self.encryption.decrypt_key(k),
+                    self.encryption.decrypt_value(v),
                 )
             })
         })
@@ -537,19 +546,19 @@ where
         V: Into<IVec>,
     {
         self.encryption.decrypt_value_result(self.inner.insert(
-            self.encryption.encrypt_key_ref(key),
-            self.encryption.encrypt_value_ivec(value),
+            self.encryption.encrypt_key(key.as_ref()),
+            self.encryption.encrypt_value(value),
         ))
     }
 
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
         self.encryption
-            .decrypt_value_result(self.inner.get(self.encryption.encrypt_key_ref(key)))
+            .decrypt_value_result(self.inner.get(self.encryption.encrypt_key(key.as_ref())))
     }
 
     pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
         self.encryption
-            .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key_ref(key)))
+            .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key(key.as_ref())))
     }
 
     pub fn transaction<F, A, Error>(&self, f: F) -> transaction::TransactionResult<A, Error>
@@ -569,13 +578,13 @@ where
     pub fn watch_prefix<P: AsRef<[u8]>>(&self, prefix: P) -> Subscriber<E> {
         Subscriber::new(
             self.inner
-                .watch_prefix(self.encryption.encrypt_key_ref(prefix)),
+                .watch_prefix(self.encryption.encrypt_key(prefix.as_ref())),
             self.encryption.clone(),
         )
     }
 
     pub fn apply_batch(&self, batch: Batch) -> Result<()> {
-        self.inner.apply_batch(batch.to_encrypted(&self.encryption))
+        self.inner.apply_batch(self.encryption.encrypt_batch(batch))
     }
 
     pub fn compare_and_swap<K, OV, NV>(
@@ -591,14 +600,14 @@ where
     {
         self.inner
             .compare_and_swap(
-                self.encryption.encrypt_key_ref(key),
-                old.map(|val| self.encryption.encrypt_value_ref(val)),
-                new.map(|val| self.encryption.encrypt_value_ivec(val)),
+                self.encryption.encrypt_key(key.as_ref()),
+                old.map(|val| self.encryption.encrypt_value(val.as_ref())),
+                new.map(|val| self.encryption.encrypt_value(val)),
             )
             .map(|res| {
                 res.map_err(|cas| CompareAndSwapError {
-                    current: cas.current.map(|v| self.encryption.decrypt_value_ivec(v)),
-                    proposed: cas.proposed.map(|v| self.encryption.decrypt_value_ivec(v)),
+                    current: cas.current.map(|v| self.encryption.decrypt_value(v)),
+                    proposed: cas.proposed.map(|v| self.encryption.decrypt_value(v)),
                 })
             })
     }
@@ -610,12 +619,12 @@ where
         V: Into<IVec>,
     {
         let new_f = move |old: Option<&[u8]>| {
-            f(old.map(|val| self.encryption.decrypt_value_ref(val)))
-                .map(|val| self.encryption.encrypt_value_ivec(val))
+            f(old.map(|val| self.encryption.decrypt_value(val.as_ref())))
+                .map(|val| self.encryption.encrypt_value(val))
         };
         self.encryption.decrypt_value_result(
             self.inner
-                .update_and_fetch(self.encryption.encrypt_key_ref(key), new_f),
+                .update_and_fetch(self.encryption.encrypt_key(key.as_ref()), new_f),
         )
     }
 
@@ -626,12 +635,12 @@ where
         V: Into<IVec>,
     {
         let new_f = move |old: Option<&[u8]>| {
-            f(old.map(|val| self.encryption.decrypt_value_ref(val)))
-                .map(|val| self.encryption.encrypt_value_ivec(val))
+            f(old.map(|val| self.encryption.decrypt_value(val.as_ref())))
+                .map(|val| self.encryption.encrypt_value(val))
         };
         self.encryption.decrypt_value_result(
             self.inner
-                .fetch_and_update(self.encryption.encrypt_key_ref(key), new_f),
+                .fetch_and_update(self.encryption.encrypt_key(key.as_ref()), new_f),
         )
     }
 
@@ -647,7 +656,7 @@ where
 
     pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
         self.inner
-            .contains_key(self.encryption.encrypt_key_ref(key))
+            .contains_key(self.encryption.encrypt_key(key.as_ref()))
     }
 
     pub fn get_lt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
@@ -655,7 +664,7 @@ where
         K: AsRef<[u8]>,
     {
         self.encryption
-            .decrypt_key_value_result(self.inner.get_lt(self.encryption.encrypt_key_ref(key)))
+            .decrypt_key_value_result(self.inner.get_lt(self.encryption.encrypt_key(key.as_ref())))
     }
 
     pub fn get_gt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
@@ -663,7 +672,7 @@ where
         K: AsRef<[u8]>,
     {
         self.encryption
-            .decrypt_key_value_result(self.inner.get_gt(self.encryption.encrypt_key_ref(key)))
+            .decrypt_key_value_result(self.inner.get_gt(self.encryption.encrypt_key(key.as_ref())))
     }
 
     pub fn first(&self) -> Result<Option<(IVec, IVec)>> {
@@ -693,8 +702,12 @@ where
         let encrypt_bound = |bound: ops::Bound<&K>| -> ops::Bound<IVec> {
             match bound {
                 ops::Bound::Unbounded => ops::Bound::Unbounded,
-                ops::Bound::Included(x) => ops::Bound::Included(self.encryption.encrypt_key_ref(x)),
-                ops::Bound::Excluded(x) => ops::Bound::Excluded(self.encryption.encrypt_key_ref(x)),
+                ops::Bound::Included(x) => {
+                    ops::Bound::Included(self.encryption.encrypt_key(x.as_ref()))
+                }
+                ops::Bound::Excluded(x) => {
+                    ops::Bound::Excluded(self.encryption.encrypt_key(x.as_ref()))
+                }
             }
         };
         let range = (
@@ -710,7 +723,7 @@ where
     {
         Iter::new(
             self.inner
-                .scan_prefix(self.encryption.encrypt_key_ref(prefix)),
+                .scan_prefix(self.encryption.encrypt_key(prefix.as_ref())),
             self.encryption.clone(),
         )
     }
@@ -728,7 +741,7 @@ where
         self.inner.clear()
     }
     pub fn name(&self) -> IVec {
-        self.encryption.decrypt_tree_name_ivec(self.inner.name())
+        self.encryption.decrypt_tree_name(self.inner.name())
     }
     #[inline]
     pub fn checksum(&self) -> Result<u32> {
@@ -746,8 +759,8 @@ where
         V: AsRef<[u8]>,
     {
         self.encryption.decrypt_value_result(self.inner.merge(
-            self.encryption.encrypt_key_ref(key),
-            self.encryption.encrypt_value_ref(value),
+            self.encryption.encrypt_key(key.as_ref()),
+            self.encryption.encrypt_value(value.as_ref()),
         ))
     }
 
@@ -755,11 +768,11 @@ where
         let encryption = self.encryption.clone();
         let new_operator = move |key: &[u8], old: Option<&[u8]>, merged: &[u8]| {
             merge_operator(
-                &encryption.decrypt_key_ref(key),
-                old.map(|v| encryption.decrypt_value_ref(v)).as_deref(),
-                &encryption.decrypt_value_ref(merged),
+                &encryption.decrypt_key(key.as_ref()),
+                old.map(|v| encryption.decrypt_value(v.as_ref())).as_deref(),
+                &encryption.decrypt_value(merged.as_ref()),
             )
-            .map(|v| encryption.encrypt_value_ivec(v).to_vec())
+            .map(|v| encryption.encrypt_value(v).to_vec())
         };
         self.inner.set_merge_operator(new_operator);
     }
@@ -794,8 +807,8 @@ pub mod transaction {
             V: Into<IVec>,
         {
             self.encryption.decrypt_value_result(self.inner.insert(
-                self.encryption.encrypt_key_ref(key),
-                self.encryption.encrypt_value_ivec(value),
+                self.encryption.encrypt_key(key.as_ref()),
+                self.encryption.encrypt_value(value),
             ))
         }
 
@@ -804,7 +817,7 @@ pub mod transaction {
             key: K,
         ) -> Result<Option<IVec>, UnabortableTransactionError> {
             self.encryption
-                .decrypt_value_result(self.inner.get(self.encryption.encrypt_key_ref(key)))
+                .decrypt_value_result(self.inner.get(self.encryption.encrypt_key(key.as_ref())))
         }
 
         pub fn remove<K: AsRef<[u8]>>(
@@ -812,12 +825,12 @@ pub mod transaction {
             key: K,
         ) -> Result<Option<IVec>, UnabortableTransactionError> {
             self.encryption
-                .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key_ref(key)))
+                .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key(key.as_ref())))
         }
 
-        pub fn apply_batch(&self, batch: Batch) -> Result<(), UnabortableTransactionError> {
+        pub fn apply_batch(&self, batch: &Batch) -> Result<(), UnabortableTransactionError> {
             self.inner
-                .apply_batch(&batch.to_encrypted(&self.encryption))
+                .apply_batch(&self.encryption.encrypt_batch(batch.clone()))
         }
 
         #[inline]
@@ -864,6 +877,7 @@ mod tests {
         F: Fn(TestDb) -> Result<()>,
     {
         for mode in &[
+            EncryptionMode::empty(),
             EncryptionMode::KEY,
             EncryptionMode::VALUE,
             EncryptionMode::TREE_NAME,
