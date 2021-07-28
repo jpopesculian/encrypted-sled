@@ -1,6 +1,6 @@
 [package]
 name = "encrypted-sled"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2018"
 description = "provides encryption wrappers to a sled database"
 license = "MIT"
