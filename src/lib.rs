@@ -504,7 +504,7 @@ impl<E> Subscriber<E>
 where
     E: Encryption,
 {
-    pub fn next_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+    pub fn next_timeout(&mut self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
         self.inner
             .next_timeout(timeout)
             .map(|event| self.encryption.decrypt_event(event))
