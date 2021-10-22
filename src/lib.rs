@@ -87,6 +87,48 @@ impl Default for EncryptionMode {
     }
 }
 
+pub trait NonceSequence<C>
+where
+    C: NewCipher,
+{
+    fn advance(&mut self) -> Nonce<C>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct CountingNonce<C>
+where
+    C: NewCipher,
+{
+    nonce: Nonce<C>,
+}
+
+impl<C> CountingNonce<C>
+where
+    C: NewCipher,
+{
+    pub fn new(nonce: Nonce<C>) -> Self {
+        Self { nonce }
+    }
+}
+
+impl<C> NonceSequence<C> for CountingNonce<C>
+where
+    C: NewCipher,
+{
+    fn advance(&mut self) -> Nonce<C> {
+        let next = self.nonce.clone();
+        for byte in self.nonce.as_mut_slice().iter_mut().rev() {
+            if *byte == 0xff {
+                *byte = 0;
+            } else {
+                *byte += 1;
+                break;
+            }
+        }
+        next
+    }
+}
+
 pub struct EncryptionCipher<C>
 where
     C: StreamCipher + NewCipher,
@@ -131,11 +173,36 @@ where
         C::new(&self.key, &self.nonce)
     }
 
-    fn apply_to_data(&self, mut data: IVec, mode: EncryptionMode) -> IVec {
-        if self.mode.contains(mode) {
-            self.cipher().apply_keystream(&mut data);
+    fn encrypt_data(&self, mut data: IVec, mode: EncryptionMode) -> IVec {
+        if !self.mode.contains(mode) {
+            return data;
         }
-        data
+
+        // TODO replace with nonce sequence
+        let nonce = &self.nonce;
+        let mut cipher = C::new(&self.key, &nonce);
+        cipher.apply_keystream(&mut data);
+
+        let nonce_size = C::NonceSize::to_usize();
+        let mut out = vec![0; nonce_size + data.len()];
+        out[..nonce_size].copy_from_slice(&nonce);
+        out[nonce_size..].copy_from_slice(&data);
+        out.into()
+    }
+
+    fn decrypt_data(&self, mut data: IVec, mode: EncryptionMode) -> IVec {
+        if !self.mode.contains(mode) {
+            return data;
+        }
+
+        let nonce_size = C::NonceSize::to_usize();
+        let mut nonce = Nonce::<C>::default();
+        nonce.copy_from_slice(&data[..nonce_size]);
+        let mut cipher = C::new(&self.key, &nonce);
+
+        let out = &mut data[nonce_size..];
+        cipher.apply_keystream(out);
+        out.to_vec().into()
     }
 }
 
@@ -269,10 +336,10 @@ where
     C: StreamCipher + NewCipher,
 {
     fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.apply_to_data(data, mode)
+        self.encrypt_data(data, mode)
     }
     fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.apply_to_data(data, mode)
+        self.decrypt_data(data, mode)
     }
 }
 
