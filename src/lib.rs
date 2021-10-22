@@ -6,12 +6,19 @@
 //!
 //! ```
 //! # let _ = std::fs::remove_dir_all("my_db");
-//! let cipher = encrypted_sled::EncryptionCipher::<chacha20::ChaCha20, encrypted_sled::CountingNonce<_>>::new_from_slices(
-//!     b"an example very very secret key.",
-//!     b"secret nonce",
-//!     encrypted_sled::EncryptionMode::default(),
-//! )
-//! .unwrap();
+//!
+//! // generate cipher (obviously use a better key and nonce)
+//! let cipher = {
+//!     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+//!     let mut key = Key::default();
+//!     key.copy_from_slice(b"an example very very secret key.");
+//!     encrypted_sled::EncryptionCipher::<ChaCha20Poly1305, _>::new(
+//!         key,
+//!         encrypted_sled::CountingNonce::new(Nonce::default()),
+//!         encrypted_sled::EncryptionMode::default(),
+//!     )
+//! };
+//!
 //! let db = encrypted_sled::open("my_db", cipher).unwrap();
 //!
 //! // insert and get
@@ -59,8 +66,8 @@
 #[macro_use]
 extern crate bitflags;
 
-use cipher::generic_array;
-use cipher::{CipherKey, NewCipher, Nonce, StreamCipher};
+use aead::generic_array;
+use aead::{Aead, AeadCore, AeadInPlace, Key, NewAead, Nonce};
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -69,7 +76,6 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use generic_array::typenum;
-use generic_array::GenericArray;
 use std::io;
 use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
@@ -96,7 +102,7 @@ impl Default for EncryptionMode {
 
 pub trait NonceSequence<C>
 where
-    C: NewCipher,
+    C: AeadCore,
 {
     fn advance(&mut self) -> Nonce<C>;
 }
@@ -104,14 +110,14 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CountingNonce<C>
 where
-    C: NewCipher,
+    C: AeadCore,
 {
     nonce: Nonce<C>,
 }
 
 impl<C> CountingNonce<C>
 where
-    C: NewCipher,
+    C: AeadCore,
 {
     pub fn new(nonce: Nonce<C>) -> Self {
         Self { nonce }
@@ -120,7 +126,7 @@ where
 
 impl<C> NonceSequence<C> for CountingNonce<C>
 where
-    C: NewCipher,
+    C: AeadCore,
 {
     fn advance(&mut self) -> Nonce<C> {
         let next = self.nonce.clone();
@@ -138,21 +144,21 @@ where
 
 pub struct EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead,
     S: NonceSequence<C>,
 {
     cipher: PhantomData<C>,
-    key: CipherKey<C>,
+    key: Key<C>,
     nonces: Arc<Mutex<S>>,
     mode: EncryptionMode,
 }
 
 impl<C, S> EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead + AeadInPlace,
     S: NonceSequence<C>,
 {
-    pub fn new(key: CipherKey<C>, nonces: S, mode: EncryptionMode) -> Self {
+    pub fn new(key: Key<C>, nonces: S, mode: EncryptionMode) -> Self {
         Self {
             cipher: PhantomData,
             key,
@@ -166,12 +172,13 @@ where
         self.mode.contains(mode)
     }
 
-    fn encrypt_data(
-        &self,
-        mut data: IVec,
-        mode: EncryptionMode,
-        nonce: Option<IVec>,
-    ) -> Result<IVec> {
+    fn salt_and_hash(&self, data: impl AsRef<[u8]>) -> blake3::Hash {
+        let mut data = data.as_ref().to_vec();
+        data.extend(&self.key);
+        blake3::hash(&data)
+    }
+
+    fn encrypt_data(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec> {
         if !self.applies_to(mode) {
             return Ok(data);
         }
@@ -197,8 +204,10 @@ where
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "Nonce sequence lock poisoned"))?
                 .advance()
         };
-        let mut cipher = C::new(&self.key, &nonce);
-        cipher.apply_keystream(&mut data);
+        let cipher = C::new(&self.key);
+        let data = cipher
+            .encrypt(&nonce, data.as_ref())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to encrypt data"))?;
 
         let mut out = vec![0; nonce_size + data.len()];
         out[..nonce_size].copy_from_slice(&nonce);
@@ -223,46 +232,24 @@ where
         Ok(nonce)
     }
 
-    fn decrypt_data(&self, mut data: IVec, mode: EncryptionMode) -> Result<IVec> {
+    fn decrypt_data(&self, data: IVec, mode: EncryptionMode) -> Result<IVec> {
         if !self.applies_to(mode) {
             return Ok(data);
         }
 
         let nonce = self.extract_nonce_from_encrypted(&data)?;
-        let mut cipher = C::new(&self.key, &nonce);
+        let cipher = C::new(&self.key);
 
-        let out = &mut data[C::NonceSize::to_usize()..];
-        cipher.apply_keystream(out);
-        Ok(out.to_vec().into())
-    }
-}
-
-impl<C> EncryptionCipher<C, CountingNonce<C>>
-where
-    C: StreamCipher + NewCipher,
-{
-    // TODO remove me
-    pub fn new_from_slices(
-        key: &[u8],
-        nonce: &[u8],
-        mode: EncryptionMode,
-    ) -> Result<Self, cipher::errors::InvalidLength> {
-        let kl = C::KeySize::to_usize();
-        let nl = C::NonceSize::to_usize();
-        if key.len() != kl || nonce.len() != nl {
-            Err(cipher::errors::InvalidLength)
-        } else {
-            let key = GenericArray::clone_from_slice(key);
-            let nonce = GenericArray::clone_from_slice(nonce);
-            let nonces = CountingNonce::new(nonce);
-            Ok(Self::new(key, nonces, mode))
-        }
+        let data = cipher
+            .decrypt(&nonce, &data[C::NonceSize::to_usize()..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to decrypt data"))?;
+        Ok(data.into())
     }
 }
 
 impl<C, S> Clone for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead,
     S: NonceSequence<C>,
 {
     fn clone(&self) -> Self {
@@ -277,7 +264,7 @@ where
 
 impl<C, S> fmt::Debug for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead,
     S: NonceSequence<C>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -292,19 +279,17 @@ const DEFAULT_TREE_NAME: &[u8] = b"__sled__default";
 const KEY_NONCE_PREFIX: &[u8] = b"__encrypted_sled__key_nonce_";
 const TREE_NONCE_PREFIX: &[u8] = b"__encrypted_sled__tree_nonce_";
 
-fn key_nonce_key(data: impl AsRef<[u8]>) -> [u8; KEY_NONCE_PREFIX.len() + blake3::OUT_LEN] {
+fn key_nonce_key(hashed: blake3::Hash) -> [u8; KEY_NONCE_PREFIX.len() + blake3::OUT_LEN] {
     let mut key = [0u8; KEY_NONCE_PREFIX.len() + blake3::OUT_LEN];
     key[..KEY_NONCE_PREFIX.len()].copy_from_slice(KEY_NONCE_PREFIX);
-    key[KEY_NONCE_PREFIX.len()..]
-        .copy_from_slice(blake3::hash(data.as_ref()).as_bytes().as_slice());
+    key[KEY_NONCE_PREFIX.len()..].copy_from_slice(hashed.as_bytes().as_slice());
     key
 }
 
-fn tree_nonce_key(data: impl AsRef<[u8]>) -> [u8; TREE_NONCE_PREFIX.len() + blake3::OUT_LEN] {
+fn tree_nonce_key(hashed: blake3::Hash) -> [u8; TREE_NONCE_PREFIX.len() + blake3::OUT_LEN] {
     let mut key = [0u8; TREE_NONCE_PREFIX.len() + blake3::OUT_LEN];
     key[..TREE_NONCE_PREFIX.len()].copy_from_slice(TREE_NONCE_PREFIX);
-    key[TREE_NONCE_PREFIX.len()..]
-        .copy_from_slice(blake3::hash(data.as_ref()).as_bytes().as_slice());
+    key[TREE_NONCE_PREFIX.len()..].copy_from_slice(hashed.as_bytes().as_slice());
     key
 }
 
@@ -328,6 +313,7 @@ pub trait Encryption {
     fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec>;
     fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> Result<IVec>;
     fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec>;
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash;
     fn applies_to_key(&self) -> bool {
         self.applies_to(EncryptionMode::KEY)
     }
@@ -447,11 +433,14 @@ where
     fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec> {
         self.deref().get_nonce_from_encrypted(data)
     }
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash {
+        self.deref().salt_and_hash(data)
+    }
 }
 
 impl<C, S> Encryption for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead + AeadInPlace,
     S: NonceSequence<C>,
 {
     fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec> {
@@ -465,6 +454,9 @@ where
     }
     fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec> {
         Ok(self.extract_nonce_from_encrypted(data)?.as_slice().into())
+    }
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash {
+        self.salt_and_hash(data)
     }
 }
 
@@ -590,7 +582,8 @@ where
             .map(|tree| Tree::new(tree, self.encryption.clone()))?;
         if self.encryption.applies_to_tree_name() {
             let nonce = self.encryption.get_nonce_from_encrypted(&encrypted_name)?;
-            self.inner.insert(&tree_nonce_key(&name), nonce)?;
+            self.inner
+                .insert(&tree_nonce_key(self.encryption.salt_and_hash(name)), nonce)?;
         }
         Ok(tree)
     }
@@ -600,7 +593,8 @@ where
             .encrypt_tree_name(name.as_ref(), self.default_tree_nonce_fn())?;
         let dropped = self.inner.drop_tree(encrypted_name)?;
         if self.encryption.applies_to_tree_name() {
-            self.inner.remove(&tree_nonce_key(&name))?;
+            self.inner
+                .remove(&tree_nonce_key(self.encryption.salt_and_hash(name)))?;
         }
         Ok(dropped)
     }
@@ -628,7 +622,10 @@ where
         self.inner.size_on_disk()
     }
     fn default_tree_nonce_fn(&self) -> DefaultNonceFn<Error> {
-        Box::new(move |data| self.inner.get(&tree_nonce_key(data)))
+        Box::new(move |data| {
+            self.inner
+                .get(&tree_nonce_key(self.encryption.salt_and_hash(data)))
+        })
     }
 
     // TODO implement export and import
@@ -1044,7 +1041,10 @@ where
     }
 
     fn default_key_nonce_fn(&self) -> DefaultNonceFn<Error> {
-        Box::new(move |data| self.inner.get(&key_nonce_key(data)))
+        Box::new(move |data| {
+            self.inner
+                .get(&key_nonce_key(self.encryption.salt_and_hash(data)))
+        })
     }
 }
 
@@ -1135,7 +1135,10 @@ pub mod transaction {
                 let nonce = self
                     .encryption
                     .get_nonce_from_encrypted(&encrypted_key_name)?;
-                self.inner.insert(key_nonce_key(&key).as_slice(), nonce)?;
+                self.inner.insert(
+                    key_nonce_key(self.encryption.salt_and_hash(key)).as_slice(),
+                    nonce,
+                )?;
             }
             Ok(res)
         }
@@ -1151,7 +1154,8 @@ pub mod transaction {
                 .encryption
                 .decrypt_value_result(self.inner.remove(encrypted_key_name))?;
             if self.encryption.applies_to_key() {
-                self.inner.remove(key_nonce_key(&key).as_slice())?;
+                self.inner
+                    .remove(key_nonce_key(self.encryption.salt_and_hash(key)).as_slice())?;
             }
             Ok(res)
         }
@@ -1181,7 +1185,10 @@ pub mod transaction {
         }
 
         fn default_key_nonce_fn(&self) -> DefaultNonceFn<UnabortableTransactionError> {
-            Box::new(move |data| self.inner.get(&key_nonce_key(data)))
+            Box::new(move |data| {
+                self.inner
+                    .get(&key_nonce_key(self.encryption.salt_and_hash(data)))
+            })
         }
     }
 }
@@ -1193,16 +1200,21 @@ pub fn open<P: AsRef<Path>, E: Encryption>(path: P, encryption: E) -> Result<Db<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20::ChaCha20;
+    use chacha20poly1305::ChaCha20Poly1305;
 
-    type TestCipher = EncryptionCipher<ChaCha20, CountingNonce<ChaCha20>>;
+    type TestCipher = EncryptionCipher<ChaCha20Poly1305, CountingNonce<ChaCha20Poly1305>>;
     type TestDb = Db<TestCipher>;
 
     const ENCRYPTION_KEY: &[u8] = b"an example very very secret key.";
-    const ENCRYPTION_NONCE: &[u8] = b"secret nonce";
 
     fn test_cipher(mode: EncryptionMode) -> TestCipher {
-        EncryptionCipher::new_from_slices(ENCRYPTION_KEY, ENCRYPTION_NONCE, mode).unwrap()
+        let mut key = Key::<ChaCha20Poly1305>::default();
+        key.copy_from_slice(&ENCRYPTION_KEY);
+        EncryptionCipher::new(
+            key,
+            CountingNonce::new(Nonce::<ChaCha20Poly1305>::default()),
+            mode,
+        )
     }
 
     fn temp_db(mode: EncryptionMode) -> TestDb {
