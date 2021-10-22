@@ -697,14 +697,20 @@ where
     E: Encryption,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|res| {
-            res.and_then(|(k, v)| {
+        while let Some(res) = self.inner.next_back() {
+            if let Ok((k, _)) = res.as_ref() {
+                if is_system_key(k) {
+                    continue;
+                }
+            }
+            return Some(res.and_then(|(k, v)| {
                 Ok((
                     self.encryption.decrypt_key(k)?,
                     self.encryption.decrypt_value(v)?,
                 ))
-            })
-        })
+            }));
+        }
+        None
     }
 }
 
@@ -762,10 +768,6 @@ impl<E> Tree<E>
 where
     E: Encryption,
 {
-    fn default_key_nonce_fn(&self) -> DefaultNonceFn<Error> {
-        Box::new(move |data| self.inner.get(&key_nonce_key(data)))
-    }
-
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
         self.encryption.decrypt_value_result(
             self.inner.get(
@@ -1018,24 +1020,31 @@ where
         ))
     }
 
-    #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.iter().count()
     }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
     #[inline]
     pub fn clear(&self) -> Result<()> {
         self.inner.clear()
     }
+
     pub fn name(&self) -> Result<IVec> {
         self.encryption.decrypt_tree_name(self.inner.name())
     }
+
     #[inline]
     pub fn checksum(&self) -> Result<u32> {
         self.inner.checksum()
+    }
+
+    fn default_key_nonce_fn(&self) -> DefaultNonceFn<Error> {
+        Box::new(move |data| self.inner.get(&key_nonce_key(data)))
     }
 }
 
@@ -1092,10 +1101,6 @@ pub mod transaction {
     {
         pub(crate) fn new(inner: sled::transaction::TransactionalTree, encryption: Arc<E>) -> Self {
             Self { inner, encryption }
-        }
-
-        fn default_key_nonce_fn(&self) -> DefaultNonceFn<UnabortableTransactionError> {
-            Box::new(move |data| self.inner.get(&key_nonce_key(data)))
         }
 
         pub fn get<K: AsRef<[u8]>>(
@@ -1173,6 +1178,10 @@ pub mod transaction {
         #[inline]
         pub fn generate_id(&self) -> Result<u64> {
             self.inner.generate_id()
+        }
+
+        fn default_key_nonce_fn(&self) -> DefaultNonceFn<UnabortableTransactionError> {
+            Box::new(move |data| self.inner.get(&key_nonce_key(data)))
         }
     }
 }
