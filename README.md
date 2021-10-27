@@ -8,14 +8,13 @@ and use normally.
 
 ```rust
 
-// generate cipher (obviously use a better key and nonce)
 let cipher = {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     let mut key = Key::default();
     key.copy_from_slice(b"an example very very secret key.");
     encrypted_sled::EncryptionCipher::<ChaCha20Poly1305, _>::new(
         key,
-        encrypted_sled::CountingNonce::new(Nonce::default()),
+        encrypted_sled::RandNonce::new(rand::thread_rng()),
         encrypted_sled::EncryptionMode::default(),
     )
 };
