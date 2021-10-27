@@ -5,12 +5,19 @@ edition = "2018"
 description = "provides encryption wrappers to a sled database"
 license = "MIT"
 repository = "https://github.com/jpopesculian/encrypted-sled"
+resolver = "2"
+
+[features]
+default = ["rand"]
 
 [dependencies]
 aead = { version = "0.4.3", features = ["alloc"] }
 bitflags = "1.2.1"
 blake3 = "1.1.0"
+rand = { version = "0.8.4", optional = true, default-features = false, features = ["std"] }
 sled = "0.34.6"
 
 [dev-dependencies]
 chacha20poly1305 = "0.9.0"
+rand = { version = "0.8.4", features = ["std_rng"] }
+

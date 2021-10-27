@@ -7,14 +7,13 @@
 //! ```
 //! # let _ = std::fs::remove_dir_all("my_db");
 //!
-//! // generate cipher (obviously use a better key and nonce)
 //! let cipher = {
 //!     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 //!     let mut key = Key::default();
 //!     key.copy_from_slice(b"an example very very secret key.");
 //!     encrypted_sled::EncryptionCipher::<ChaCha20Poly1305, _>::new(
 //!         key,
-//!         encrypted_sled::CountingNonce::new(Nonce::default()),
+//!         encrypted_sled::RandNonce::new(rand::thread_rng()),
 //!         encrypted_sled::EncryptionMode::default(),
 //!     )
 //! };
@@ -104,7 +103,7 @@ pub trait NonceSequence<C>
 where
     C: AeadCore,
 {
-    fn advance(&mut self) -> Nonce<C>;
+    fn advance(&mut self) -> Result<Nonce<C>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
@@ -128,7 +127,7 @@ impl<C> NonceSequence<C> for CountingNonce<C>
 where
     C: AeadCore,
 {
-    fn advance(&mut self) -> Nonce<C> {
+    fn advance(&mut self) -> Result<Nonce<C>> {
         let next = self.nonce.clone();
         for byte in self.nonce.as_mut_slice().iter_mut().rev() {
             if *byte == 0xff {
@@ -138,7 +137,41 @@ where
                 break;
             }
         }
-        next
+        Ok(next)
+    }
+}
+
+#[cfg(feature = "rand")]
+pub struct RandNonce<R>
+where
+    R: rand::RngCore,
+{
+    rng: R,
+}
+
+#[cfg(feature = "rand")]
+impl<R> RandNonce<R>
+where
+    R: rand::RngCore,
+{
+    pub fn new(rng: R) -> Self {
+        Self { rng }
+    }
+}
+
+#[cfg(feature = "rand")]
+impl<R, C> NonceSequence<C> for RandNonce<R>
+where
+    C: AeadCore,
+    R: rand::RngCore,
+{
+    fn advance(&mut self) -> Result<Nonce<C>> {
+        use rand::Rng;
+        let mut out = Nonce::<C>::default();
+        self.rng
+            .try_fill(out.as_mut_slice())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(out)
     }
 }
 
@@ -202,7 +235,7 @@ where
             self.nonces
                 .lock()
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "Nonce sequence lock poisoned"))?
-                .advance()
+                .advance()?
         };
         let cipher = C::new(&self.key);
         let data = cipher
