@@ -83,9 +83,14 @@ use typenum::Unsigned;
 
 pub use sled::{CompareAndSwapError, Error, Event, IVec, MergeOperator, Mode};
 
+/// The top-level result type for dealing with fallible operations. The errors tend to
+/// be fail-stop, and nested results are used in cases where the outer fail-stop error can
+/// have try ? used on it, exposing the inner operation that is expected to fail under
+/// normal operation. The philosophy behind this is detailed on the sled blog.
 pub type Result<T, E = sled::Error> = std::result::Result<T, E>;
 
 bitflags! {
+/// A descriptor for which data should be encrypted/decrypted
 pub struct EncryptionMode: u32 {
     const KEY = 0b0001;
     const VALUE = 0b0010;
@@ -99,13 +104,16 @@ impl Default for EncryptionMode {
     }
 }
 
+/// Describes a sequence of nonces, similar to an Iterator
 pub trait NonceSequence<C>
 where
     C: AeadCore,
 {
+    /// Get the next nonce in the sequence. May return an erro if there is no more nonce
     fn advance(&mut self) -> Result<Nonce<C>>;
 }
 
+/// A simple nonce which always increments by one
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 pub struct CountingNonce<C>
 where
@@ -141,6 +149,7 @@ where
     }
 }
 
+/// A simple nonce which randomly generates the next nonce in the sequnce
 #[cfg(feature = "rand")]
 pub struct RandNonce<R>
 where
@@ -175,6 +184,8 @@ where
     }
 }
 
+/// Describes the [`Key`], [`NonceSequence`] and [`EncryptionMode`] used to encrypt / decrypt
+/// the data
 pub struct EncryptionCipher<C, S>
 where
     C: AeadCore + NewAead,
@@ -191,6 +202,7 @@ where
     C: AeadCore + NewAead + AeadInPlace,
     S: NonceSequence<C>,
 {
+    /// Create a new EncryptionCipher
     pub fn new(key: Key<C>, nonces: S, mode: EncryptionMode) -> Self {
         Self {
             cipher: PhantomData,
@@ -341,6 +353,7 @@ fn no_nonce(_: &IVec) -> Result<Option<IVec>> {
     Ok(None)
 }
 
+/// Encryption operations
 pub trait Encryption {
     fn applies_to(&self, mode: EncryptionMode) -> bool;
     fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec>;
@@ -493,6 +506,7 @@ where
     }
 }
 
+/// A flash-sympathetic persistent lock-free B+ tree.
 #[derive(Debug, Clone)]
 pub struct Tree<E> {
     inner: sled::Tree,
@@ -505,6 +519,7 @@ impl<E> Tree<E> {
     }
 }
 
+/// Top-level configuration for the system.
 #[derive(Debug, Clone)]
 pub struct Db<E> {
     inner: sled::Db,
@@ -530,6 +545,8 @@ impl<E> ops::Deref for Db<E> {
     }
 }
 
+/// The sled embedded database! Implements Deref<Target = sled::Tree> to refer to a default
+/// keyspace / namespace / bucket.
 #[derive(Debug, Clone)]
 pub struct Config<E> {
     inner: sled::Config,
@@ -577,12 +594,14 @@ where
     config_fn!(print_profile_on_drop, bool);
 }
 
+/// A batch of updates that will be applied atomically to the Tree.
 #[derive(Debug, Clone, Default)]
 pub struct Batch {
     events: Vec<Event>,
 }
 
 impl Batch {
+    /// Set a key to a new value
     pub fn insert<K, V>(&mut self, key: K, value: V)
     where
         K: Into<IVec>,
@@ -593,6 +612,7 @@ impl Batch {
             value: value.into(),
         })
     }
+    /// Remove a key
     pub fn remove<K>(&mut self, key: K)
     where
         K: Into<IVec>,
@@ -605,6 +625,8 @@ impl<E> Db<E>
 where
     E: Encryption,
 {
+    /// Open or create a new disk-backed Tree with its own keyspace, accessible from the Db via
+    /// the provided identifier.
     pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<Tree<E>> {
         let encrypted_name = self
             .encryption
@@ -620,6 +642,7 @@ where
         }
         Ok(tree)
     }
+    /// Remove a disk-backed collection.
     pub fn drop_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<bool> {
         let encrypted_name = self
             .encryption
@@ -631,6 +654,7 @@ where
         }
         Ok(dropped)
     }
+    /// Returns the trees names saved in this Db.
     pub fn tree_names(&self) -> Result<Vec<IVec>> {
         self.inner
             .tree_names()
@@ -664,6 +688,7 @@ where
     // TODO implement export and import
 }
 
+/// An iterator over keys and values in a Tree.
 pub struct Iter<E> {
     inner: sled::Iter,
     encryption: Arc<E>,
@@ -744,6 +769,7 @@ where
     }
 }
 
+/// A subscriber listening on a specified prefix
 pub struct Subscriber<E> {
     inner: sled::Subscriber,
     encryption: Arc<E>,
@@ -1116,6 +1142,7 @@ where
     }
 }
 
+/// Fully serializable (ACID) multi-Tree transactions
 pub mod transaction {
     use super::*;
     pub use sled::transaction::{
@@ -1123,6 +1150,7 @@ pub mod transaction {
         TransactionResult, UnabortableTransactionError,
     };
 
+    /// A transaction that will be applied atomically to the Tree.
     pub struct TransactionalTree<E> {
         inner: sled::transaction::TransactionalTree,
         encryption: Arc<E>,
@@ -1136,6 +1164,7 @@ pub mod transaction {
             Self { inner, encryption }
         }
 
+        /// Get the value associated with a key
         pub fn get<K: AsRef<[u8]>>(
             &self,
             key: K,
@@ -1148,6 +1177,7 @@ pub mod transaction {
             )
         }
 
+        /// Set a key to a new value
         pub fn insert<K, V>(
             &self,
             key: K,
@@ -1176,6 +1206,7 @@ pub mod transaction {
             Ok(res)
         }
 
+        /// Remove a key
         pub fn remove<K: AsRef<[u8]>>(
             &self,
             key: K,
@@ -1193,6 +1224,7 @@ pub mod transaction {
             Ok(res)
         }
 
+        /// Atomically apply multiple inserts and removals.
         pub fn apply_batch(&self, batch: &Batch) -> Result<(), UnabortableTransactionError> {
             for event in batch.events.iter() {
                 match event {
@@ -1207,11 +1239,19 @@ pub mod transaction {
             Ok(())
         }
 
+        /// Flush the database before returning from the transaction.
         #[inline]
         pub fn flush(&self) {
             self.inner.flush()
         }
 
+        /// Generate a monotonic ID. Not guaranteed to be contiguous or idempotent,
+        /// can produce different values in the same transaction in case of conflicts.
+        /// Written to disk every idgen_persist_interval operations, followed by a blocking
+        /// flush. During recovery, we take the last recovered generated ID and add 2x the
+        /// idgen_persist_interval to it. While persisting, if the previous persisted counter
+        /// wasn’t synced to disk yet, we will do a blocking flush to fsync the latest counter,
+        /// ensuring that we will never give out the same counter twice.
         #[inline]
         pub fn generate_id(&self) -> Result<u64> {
             self.inner.generate_id()
@@ -1226,6 +1266,11 @@ pub mod transaction {
     }
 }
 
+/// Opens a Db with a default configuration at the specified path. This will create a new
+/// storage directory at the specified path if it does not already exist. You can use the
+/// Db::was_recovered method to determine if your database was recovered from a previous
+/// instance. You can use Config::create_new if you want to increase the chances that the
+/// database will be freshly created.
 pub fn open<P: AsRef<Path>, E: Encryption>(path: P, encryption: E) -> Result<Db<E>> {
     sled::open(path).map(|db| Db::new(db, Arc::new(encryption)))
 }
