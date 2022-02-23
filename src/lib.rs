@@ -1,4 +1,4 @@
-//! `encrypted-sled` is a drop in replacement / wrapper around the amazing
+//! `encrypted-sled` is an (almost) drop in replacement / wrapper around the amazing
 //! [`sled`](https://crates.io/crates/sled) embedded database. Just configure with an encryption
 //! and use normally.
 //!
@@ -6,12 +6,18 @@
 //!
 //! ```
 //! # let _ = std::fs::remove_dir_all("my_db");
-//! let cipher = encrypted_sled::EncryptionCipher::<chacha20::ChaCha20>::new_from_slices(
-//!     b"an example very very secret key.",
-//!     b"secret nonce",
-//!     encrypted_sled::EncryptionMode::default(),
-//! )
-//! .unwrap();
+//!
+//! let cipher = {
+//!     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+//!     let mut key = Key::default();
+//!     key.copy_from_slice(b"an example very very secret key.");
+//!     encrypted_sled::EncryptionCipher::<ChaCha20Poly1305, _>::new(
+//!         key,
+//!         encrypted_sled::RandNonce::new(rand::thread_rng()),
+//!         encrypted_sled::EncryptionMode::default(),
+//!     )
+//! };
+//!
 //! let db = encrypted_sled::open("my_db", cipher).unwrap();
 //!
 //! // insert and get
@@ -28,7 +34,7 @@
 //!
 //! // Iterates over key-value pairs, starting at the given key.
 //! let scan_key: &[u8] = b"a non-present key before yo!";
-//! let mut iter = db.range(scan_key..);
+//! let mut iter = db.range(scan_key..).unwrap();
 //! assert_eq!(&iter.next().unwrap().unwrap().0, b"yo!");
 //! assert_eq!(iter.next(), None);
 //!
@@ -49,12 +55,18 @@
 //!
 //! * `TransactionalTrees` (e.g. performing a transaction on multiple trees at the same time)
 //! * Database import/export
+//!
+//! A few functions don't handle encryption/decryption gracefully and therefore may cause corrupted
+//! data, so please use at your own risk! Encrypted keys will most likely break these
+//!
+//! * `update_and_fetch` and `fetch_and_update`
+//! * Merge operators
 
 #[macro_use]
 extern crate bitflags;
 
-use cipher::generic_array;
-use cipher::{CipherKey, NewCipher, Nonce, StreamCipher};
+use aead::generic_array;
+use aead::{Aead, AeadCore, AeadInPlace, Key, NewAead, Nonce};
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -63,17 +75,22 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use generic_array::typenum;
-use generic_array::GenericArray;
+use std::io;
 use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use typenum::Unsigned;
 
 pub use sled::{CompareAndSwapError, Error, Event, IVec, MergeOperator, Mode};
 
+/// The top-level result type for dealing with fallible operations. The errors tend to
+/// be fail-stop, and nested results are used in cases where the outer fail-stop error can
+/// have try ? used on it, exposing the inner operation that is expected to fail under
+/// normal operation. The philosophy behind this is detailed on the sled blog.
 pub type Result<T, E = sled::Error> = std::result::Result<T, E>;
 
 bitflags! {
+/// A descriptor for which data should be encrypted/decrypted
 pub struct EncryptionMode: u32 {
     const KEY = 0b0001;
     const VALUE = 0b0010;
@@ -87,75 +104,213 @@ impl Default for EncryptionMode {
     }
 }
 
-pub struct EncryptionCipher<C>
+/// Describes a sequence of nonces, similar to an Iterator
+pub trait NonceSequence<C>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore,
+{
+    /// Get the next nonce in the sequence. May return an erro if there is no more nonce
+    fn advance(&mut self) -> Result<Nonce<C>>;
+}
+
+/// A simple nonce which always increments by one
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct CountingNonce<C>
+where
+    C: AeadCore,
+{
+    nonce: Nonce<C>,
+}
+
+impl<C> CountingNonce<C>
+where
+    C: AeadCore,
+{
+    pub fn new(nonce: Nonce<C>) -> Self {
+        Self { nonce }
+    }
+}
+
+impl<C> NonceSequence<C> for CountingNonce<C>
+where
+    C: AeadCore,
+{
+    fn advance(&mut self) -> Result<Nonce<C>> {
+        let next = self.nonce.clone();
+        for byte in self.nonce.as_mut_slice().iter_mut().rev() {
+            if *byte == 0xff {
+                *byte = 0;
+            } else {
+                *byte += 1;
+                break;
+            }
+        }
+        Ok(next)
+    }
+}
+
+/// A simple nonce which randomly generates the next nonce in the sequnce
+#[cfg(feature = "rand")]
+pub struct RandNonce<R>
+where
+    R: rand::RngCore,
+{
+    rng: R,
+}
+
+#[cfg(feature = "rand")]
+impl<R> RandNonce<R>
+where
+    R: rand::RngCore,
+{
+    pub fn new(rng: R) -> Self {
+        Self { rng }
+    }
+}
+
+#[cfg(feature = "rand")]
+impl<R, C> NonceSequence<C> for RandNonce<R>
+where
+    C: AeadCore,
+    R: rand::RngCore,
+{
+    fn advance(&mut self) -> Result<Nonce<C>> {
+        use rand::Rng;
+        let mut out = Nonce::<C>::default();
+        self.rng
+            .try_fill(out.as_mut_slice())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(out)
+    }
+}
+
+/// Describes the [`Key`], [`NonceSequence`] and [`EncryptionMode`] used to encrypt / decrypt
+/// the data
+pub struct EncryptionCipher<C, S>
+where
+    C: AeadCore + NewAead,
+    S: NonceSequence<C>,
 {
     cipher: PhantomData<C>,
-    key: CipherKey<C>,
-    nonce: Nonce<C>,
+    key: Key<C>,
+    nonces: Arc<Mutex<S>>,
     mode: EncryptionMode,
 }
 
-impl<C> EncryptionCipher<C>
+impl<C, S> EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead + AeadInPlace,
+    S: NonceSequence<C>,
 {
-    pub fn new(key: CipherKey<C>, nonce: Nonce<C>, mode: EncryptionMode) -> Self {
+    /// Create a new EncryptionCipher
+    pub fn new(key: Key<C>, nonces: S, mode: EncryptionMode) -> Self {
         Self {
             cipher: PhantomData,
             key,
-            nonce,
+            nonces: Arc::new(Mutex::new(nonces)),
             mode,
         }
     }
 
-    pub fn new_from_slices(
-        key: &[u8],
-        nonce: &[u8],
-        mode: EncryptionMode,
-    ) -> Result<Self, cipher::errors::InvalidLength> {
-        let kl = C::KeySize::to_usize();
-        let nl = C::NonceSize::to_usize();
-        if key.len() != kl || nonce.len() != nl {
-            Err(cipher::errors::InvalidLength)
-        } else {
-            let key = GenericArray::clone_from_slice(key);
-            let nonce = GenericArray::clone_from_slice(nonce);
-            Ok(Self::new(key, nonce, mode))
-        }
-    }
-
     #[inline]
-    pub fn cipher(&self) -> C {
-        C::new(&self.key, &self.nonce)
+    fn applies_to(&self, mode: EncryptionMode) -> bool {
+        self.mode.contains(mode)
     }
 
-    fn apply_to_data(&self, mut data: IVec, mode: EncryptionMode) -> IVec {
-        if self.mode.contains(mode) {
-            self.cipher().apply_keystream(&mut data);
+    fn salt_and_hash(&self, data: impl AsRef<[u8]>) -> blake3::Hash {
+        let mut data = data.as_ref().to_vec();
+        data.extend(&self.key);
+        blake3::hash(&data)
+    }
+
+    fn encrypt_data(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec> {
+        if !self.applies_to(mode) {
+            return Ok(data);
         }
-        data
+
+        let nonce_size = C::NonceSize::to_usize();
+        let nonce = if let Some(nonce) = nonce {
+            if nonce.len() != nonce_size {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid nonce: expected {} bytes, got {} bytes",
+                        nonce_size,
+                        nonce.len()
+                    ),
+                )));
+            }
+            let mut new_nonce = Nonce::<C>::default();
+            new_nonce.copy_from_slice(&nonce);
+            new_nonce
+        } else {
+            self.nonces
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Nonce sequence lock poisoned"))?
+                .advance()?
+        };
+        let cipher = C::new(&self.key);
+        let data = cipher
+            .encrypt(&nonce, data.as_ref())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to encrypt data"))?;
+
+        let mut out = vec![0; nonce_size + data.len()];
+        out[..nonce_size].copy_from_slice(&nonce);
+        out[nonce_size..].copy_from_slice(&data);
+        Ok(out.into())
+    }
+
+    fn extract_nonce_from_encrypted(&self, data: &IVec) -> Result<Nonce<C>> {
+        let nonce_size = C::NonceSize::to_usize();
+        if data.len() < nonce_size {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Encrypted data is too small. Expected at least {} bytes, got {} bytes",
+                    nonce_size,
+                    data.len()
+                ),
+            )));
+        }
+        let mut nonce = Nonce::<C>::default();
+        nonce.copy_from_slice(&data[..nonce_size]);
+        Ok(nonce)
+    }
+
+    fn decrypt_data(&self, data: IVec, mode: EncryptionMode) -> Result<IVec> {
+        if !self.applies_to(mode) {
+            return Ok(data);
+        }
+
+        let nonce = self.extract_nonce_from_encrypted(&data)?;
+        let cipher = C::new(&self.key);
+
+        let data = cipher
+            .decrypt(&nonce, &data[C::NonceSize::to_usize()..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to decrypt data"))?;
+        Ok(data.into())
     }
 }
 
-impl<C> Clone for EncryptionCipher<C>
+impl<C, S> Clone for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead,
+    S: NonceSequence<C>,
 {
     fn clone(&self) -> Self {
         Self {
             cipher: self.cipher,
             key: self.key.clone(),
-            nonce: self.nonce.clone(),
+            nonces: self.nonces.clone(),
             mode: self.mode,
         }
     }
 }
 
-impl<C> fmt::Debug for EncryptionCipher<C>
+impl<C, S> fmt::Debug for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead,
+    S: NonceSequence<C>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EncryptionCipher")
@@ -166,88 +321,144 @@ where
 }
 
 const DEFAULT_TREE_NAME: &[u8] = b"__sled__default";
+const KEY_NONCE_PREFIX: &[u8] = b"__encrypted_sled__key_nonce_";
+const TREE_NONCE_PREFIX: &[u8] = b"__encrypted_sled__tree_nonce_";
 
+fn key_nonce_key(hashed: blake3::Hash) -> [u8; KEY_NONCE_PREFIX.len() + blake3::OUT_LEN] {
+    let mut key = [0u8; KEY_NONCE_PREFIX.len() + blake3::OUT_LEN];
+    key[..KEY_NONCE_PREFIX.len()].copy_from_slice(KEY_NONCE_PREFIX);
+    key[KEY_NONCE_PREFIX.len()..].copy_from_slice(hashed.as_bytes().as_slice());
+    key
+}
+
+fn tree_nonce_key(hashed: blake3::Hash) -> [u8; TREE_NONCE_PREFIX.len() + blake3::OUT_LEN] {
+    let mut key = [0u8; TREE_NONCE_PREFIX.len() + blake3::OUT_LEN];
+    key[..TREE_NONCE_PREFIX.len()].copy_from_slice(TREE_NONCE_PREFIX);
+    key[TREE_NONCE_PREFIX.len()..].copy_from_slice(hashed.as_bytes().as_slice());
+    key
+}
+
+fn is_system_key(key: impl AsRef<[u8]>) -> bool {
+    let k = key.as_ref();
+    (k.len() == KEY_NONCE_PREFIX.len() + blake3::OUT_LEN
+        && &k[..KEY_NONCE_PREFIX.len()] == KEY_NONCE_PREFIX)
+        || (k.len() == TREE_NONCE_PREFIX.len() + blake3::OUT_LEN
+            && &k[..TREE_NONCE_PREFIX.len()] == TREE_NONCE_PREFIX)
+}
+
+type DefaultNonceFn<'a, E> = Box<dyn Fn(&IVec) -> Result<Option<IVec>, E> + 'a>;
+
+#[inline]
+fn no_nonce(_: &IVec) -> Result<Option<IVec>> {
+    Ok(None)
+}
+
+/// Encryption operations
 pub trait Encryption {
-    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec;
-    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec;
-    #[inline]
-    fn encrypt<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
-        self.encrypt_ivec(data.into(), mode)
+    fn applies_to(&self, mode: EncryptionMode) -> bool;
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec>;
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> Result<IVec>;
+    fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec>;
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash;
+    fn applies_to_key(&self) -> bool {
+        self.applies_to(EncryptionMode::KEY)
+    }
+    fn applies_to_tree_name(&self) -> bool {
+        self.applies_to(EncryptionMode::TREE_NAME)
     }
     #[inline]
-    fn decrypt<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> IVec {
+    fn encrypt<T, E>(
+        &self,
+        data: T,
+        mode: EncryptionMode,
+        default_nonce_fn: DefaultNonceFn<E>,
+    ) -> Result<IVec, E>
+    where
+        T: Into<IVec>,
+        E: From<Error>,
+    {
+        let data = data.into();
+        let default_nonce = if self.applies_to(mode) {
+            default_nonce_fn(&data)?
+        } else {
+            None
+        };
+        Ok(self.encrypt_ivec(data, mode, default_nonce)?)
+    }
+    #[inline]
+    fn decrypt<T: Into<IVec>>(&self, data: T, mode: EncryptionMode) -> Result<IVec> {
         self.decrypt_ivec(data.into(), mode)
     }
     #[inline]
-    fn encrypt_key<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.encrypt(data, EncryptionMode::KEY)
+    fn encrypt_key<T, E>(&self, data: T, default_nonce_fn: DefaultNonceFn<E>) -> Result<IVec, E>
+    where
+        T: Into<IVec>,
+        E: From<Error>,
+    {
+        self.encrypt(data, EncryptionMode::KEY, default_nonce_fn)
     }
     #[inline]
-    fn decrypt_key<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn decrypt_key<T: Into<IVec>>(&self, data: T) -> Result<IVec> {
         self.decrypt(data, EncryptionMode::KEY)
     }
     #[inline]
-    fn encrypt_value<T: Into<IVec>>(&self, data: T) -> IVec {
-        self.encrypt(data, EncryptionMode::VALUE)
+    fn encrypt_value<T: Into<IVec>>(&self, data: T) -> Result<IVec> {
+        self.encrypt(data, EncryptionMode::VALUE, Box::new(no_nonce))
     }
     #[inline]
-    fn decrypt_value<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn decrypt_value<T: Into<IVec>>(&self, data: T) -> Result<IVec> {
         self.decrypt(data, EncryptionMode::VALUE)
     }
-    fn encrypt_tree_name<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn encrypt_tree_name<T, E>(
+        &self,
+        data: T,
+        default_nonce_fn: DefaultNonceFn<E>,
+    ) -> Result<IVec, E>
+    where
+        T: Into<IVec>,
+        E: From<Error>,
+    {
         let data = data.into();
         if data == DEFAULT_TREE_NAME {
-            return data;
+            return Ok(data);
         }
-        self.encrypt(data, EncryptionMode::TREE_NAME)
+        self.encrypt(data, EncryptionMode::TREE_NAME, default_nonce_fn)
     }
-    fn decrypt_tree_name<T: Into<IVec>>(&self, data: T) -> IVec {
+    fn decrypt_tree_name<T: Into<IVec>>(&self, data: T) -> Result<IVec> {
         let data = data.into();
         if data == DEFAULT_TREE_NAME {
-            return data;
+            return Ok(data);
         }
         self.decrypt(data, EncryptionMode::TREE_NAME)
     }
-    fn decrypt_value_result<E>(&self, res: Result<Option<IVec>, E>) -> Result<Option<IVec>, E> {
-        res.map(|val| val.map(|val| self.decrypt_value(val)))
+    fn decrypt_value_result<E>(&self, res: Result<Option<IVec>, E>) -> Result<Option<IVec>, E>
+    where
+        E: From<Error>,
+    {
+        Ok(match res? {
+            None => None,
+            Some(val) => Some(self.decrypt_value(val)?),
+        })
     }
     fn decrypt_key_value_result(
         &self,
         res: Result<Option<(IVec, IVec)>>,
     ) -> Result<Option<(IVec, IVec)>> {
-        res.map(|val| val.map(|(key, val)| (self.decrypt_key(key), self.decrypt_value(val))))
+        Ok(match res? {
+            None => None,
+            Some((key, val)) => Some((self.decrypt_key(key)?, self.decrypt_value(val)?)),
+        })
     }
-    fn encrypt_event(&self, event: Event) -> Event {
-        match event {
+    fn decrypt_event(&self, event: Event) -> Result<Event> {
+        Ok(match event {
             Event::Insert { key, value } => Event::Insert {
-                key: self.encrypt_key(key),
-                value: self.encrypt_value(value),
+                key: self.decrypt_key(key)?,
+                value: self.decrypt_value(value)?,
             },
             Event::Remove { key } => Event::Remove {
-                key: self.encrypt_key(key),
+                key: self.decrypt_key(key)?,
             },
-        }
-    }
-    fn decrypt_event(&self, event: Event) -> Event {
-        match event {
-            Event::Insert { key, value } => Event::Insert {
-                key: self.decrypt_key(key),
-                value: self.decrypt_value(value),
-            },
-            Event::Remove { key } => Event::Remove {
-                key: self.decrypt_key(key),
-            },
-        }
-    }
-    fn encrypt_batch(&self, batch: Batch) -> sled::Batch {
-        let mut encrypted = sled::Batch::default();
-        for event in batch.events {
-            match self.encrypt_event(event) {
-                Event::Insert { key, value } => encrypted.insert(key, value),
-                Event::Remove { key } => encrypted.remove(key),
-            }
-        }
-        encrypted
+        })
     }
 }
 
@@ -256,26 +467,46 @@ where
     T: ops::Deref,
     T::Target: Encryption,
 {
-    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.deref().encrypt(data, mode)
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec> {
+        self.deref().encrypt_ivec(data, mode, nonce)
     }
-    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.deref().decrypt(data, mode)
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> Result<IVec> {
+        self.deref().decrypt_ivec(data, mode)
+    }
+    fn applies_to(&self, mode: EncryptionMode) -> bool {
+        self.deref().applies_to(mode)
+    }
+    fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec> {
+        self.deref().get_nonce_from_encrypted(data)
+    }
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash {
+        self.deref().salt_and_hash(data)
     }
 }
 
-impl<C> Encryption for EncryptionCipher<C>
+impl<C, S> Encryption for EncryptionCipher<C, S>
 where
-    C: StreamCipher + NewCipher,
+    C: AeadCore + NewAead + AeadInPlace,
+    S: NonceSequence<C>,
 {
-    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.apply_to_data(data, mode)
+    fn encrypt_ivec(&self, data: IVec, mode: EncryptionMode, nonce: Option<IVec>) -> Result<IVec> {
+        self.encrypt_data(data, mode, nonce)
     }
-    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> IVec {
-        self.apply_to_data(data, mode)
+    fn decrypt_ivec(&self, data: IVec, mode: EncryptionMode) -> Result<IVec> {
+        self.decrypt_data(data, mode)
+    }
+    fn applies_to(&self, mode: EncryptionMode) -> bool {
+        self.applies_to(mode)
+    }
+    fn get_nonce_from_encrypted(&self, data: &IVec) -> Result<IVec> {
+        Ok(self.extract_nonce_from_encrypted(data)?.as_slice().into())
+    }
+    fn salt_and_hash<D: AsRef<[u8]>>(&self, data: D) -> blake3::Hash {
+        self.salt_and_hash(data)
     }
 }
 
+/// A flash-sympathetic persistent lock-free B+ tree.
 #[derive(Debug, Clone)]
 pub struct Tree<E> {
     inner: sled::Tree,
@@ -288,6 +519,7 @@ impl<E> Tree<E> {
     }
 }
 
+/// Top-level configuration for the system.
 #[derive(Debug, Clone)]
 pub struct Db<E> {
     inner: sled::Db,
@@ -313,6 +545,8 @@ impl<E> ops::Deref for Db<E> {
     }
 }
 
+/// The sled embedded database! Implements Deref<Target = sled::Tree> to refer to a default
+/// keyspace / namespace / bucket.
 #[derive(Debug, Clone)]
 pub struct Config<E> {
     inner: sled::Config,
@@ -360,12 +594,14 @@ where
     config_fn!(print_profile_on_drop, bool);
 }
 
+/// A batch of updates that will be applied atomically to the Tree.
 #[derive(Debug, Clone, Default)]
 pub struct Batch {
     events: Vec<Event>,
 }
 
 impl Batch {
+    /// Set a key to a new value
     pub fn insert<K, V>(&mut self, key: K, value: V)
     where
         K: Into<IVec>,
@@ -376,6 +612,7 @@ impl Batch {
             value: value.into(),
         })
     }
+    /// Remove a key
     pub fn remove<K>(&mut self, key: K)
     where
         K: Into<IVec>,
@@ -388,16 +625,37 @@ impl<E> Db<E>
 where
     E: Encryption,
 {
+    /// Open or create a new disk-backed Tree with its own keyspace, accessible from the Db via
+    /// the provided identifier.
     pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<Tree<E>> {
-        self.inner
-            .open_tree(self.encryption.encrypt_tree_name(name.as_ref()))
-            .map(|tree| Tree::new(tree, self.encryption.clone()))
+        let encrypted_name = self
+            .encryption
+            .encrypt_tree_name(name.as_ref(), self.default_tree_nonce_fn())?;
+        let tree = self
+            .inner
+            .open_tree(&encrypted_name)
+            .map(|tree| Tree::new(tree, self.encryption.clone()))?;
+        if self.encryption.applies_to_tree_name() {
+            let nonce = self.encryption.get_nonce_from_encrypted(&encrypted_name)?;
+            self.inner
+                .insert(&tree_nonce_key(self.encryption.salt_and_hash(name)), nonce)?;
+        }
+        Ok(tree)
     }
+    /// Remove a disk-backed collection.
     pub fn drop_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<bool> {
-        self.inner
-            .drop_tree(self.encryption.encrypt_tree_name(name.as_ref()))
+        let encrypted_name = self
+            .encryption
+            .encrypt_tree_name(name.as_ref(), self.default_tree_nonce_fn())?;
+        let dropped = self.inner.drop_tree(encrypted_name)?;
+        if self.encryption.applies_to_tree_name() {
+            self.inner
+                .remove(&tree_nonce_key(self.encryption.salt_and_hash(name)))?;
+        }
+        Ok(dropped)
     }
-    pub fn tree_names(&self) -> Vec<IVec> {
+    /// Returns the trees names saved in this Db.
+    pub fn tree_names(&self) -> Result<Vec<IVec>> {
         self.inner
             .tree_names()
             .into_iter()
@@ -420,10 +678,17 @@ where
     pub fn size_on_disk(&self) -> Result<u64> {
         self.inner.size_on_disk()
     }
+    fn default_tree_nonce_fn(&self) -> DefaultNonceFn<Error> {
+        Box::new(move |data| {
+            self.inner
+                .get(&tree_nonce_key(self.encryption.salt_and_hash(data)))
+        })
+    }
 
     // TODO implement export and import
 }
 
+/// An iterator over keys and values in a Tree.
 pub struct Iter<E> {
     inner: sled::Iter,
     encryption: Arc<E>,
@@ -442,14 +707,20 @@ where
     pub fn keys(self) -> impl DoubleEndedIterator<Item = Result<IVec>> + Send + Sync {
         let encryption = self.encryption;
         self.inner
-            .keys()
-            .map(move |key_res| key_res.map(|key| encryption.decrypt_key(key)))
+            .filter(|res| match res {
+                Err(_) => true,
+                Ok((k, _)) => !is_system_key(k),
+            })
+            .map(move |key_res| key_res.and_then(|(key, _)| encryption.decrypt_key(key)))
     }
     pub fn values(self) -> impl DoubleEndedIterator<Item = Result<IVec>> + Send + Sync {
         let encryption = self.encryption;
         self.inner
-            .values()
-            .map(move |key_res| key_res.map(|key| encryption.decrypt_value(key)))
+            .filter(|res| match res {
+                Err(_) => true,
+                Ok((k, _)) => !is_system_key(k),
+            })
+            .map(move |key_res| key_res.and_then(|(_, val)| encryption.decrypt_value(val)))
     }
 }
 
@@ -459,14 +730,20 @@ where
 {
     type Item = Result<(IVec, IVec)>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|res| {
-            res.map(|(k, v)| {
-                (
-                    self.encryption.decrypt_key(k),
-                    self.encryption.decrypt_value(v),
-                )
-            })
-        })
+        while let Some(res) = self.inner.next() {
+            if let Ok((k, _)) = res.as_ref() {
+                if is_system_key(k) {
+                    continue;
+                }
+            }
+            return Some(res.and_then(|(k, v)| {
+                Ok((
+                    self.encryption.decrypt_key(k)?,
+                    self.encryption.decrypt_value(v)?,
+                ))
+            }));
+        }
+        None
     }
 }
 
@@ -475,17 +752,24 @@ where
     E: Encryption,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|res| {
-            res.map(|(k, v)| {
-                (
-                    self.encryption.decrypt_key(k),
-                    self.encryption.decrypt_value(v),
-                )
-            })
-        })
+        while let Some(res) = self.inner.next_back() {
+            if let Ok((k, _)) = res.as_ref() {
+                if is_system_key(k) {
+                    continue;
+                }
+            }
+            return Some(res.and_then(|(k, v)| {
+                Ok((
+                    self.encryption.decrypt_key(k)?,
+                    self.encryption.decrypt_value(v)?,
+                ))
+            }));
+        }
+        None
     }
 }
 
+/// A subscriber listening on a specified prefix
 pub struct Subscriber<E> {
     inner: sled::Subscriber,
     encryption: Arc<E>,
@@ -504,7 +788,7 @@ impl<E> Subscriber<E>
 where
     E: Encryption,
 {
-    pub fn next_timeout(&mut self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+    pub fn next_timeout(&mut self, timeout: Duration) -> Result<Result<Event>, RecvTimeoutError> {
         self.inner
             .next_timeout(timeout)
             .map(|event| self.encryption.decrypt_event(event))
@@ -515,7 +799,7 @@ impl<E> Future for Subscriber<E>
 where
     E: Encryption,
 {
-    type Output = Option<Event>;
+    type Output = Option<Result<Event>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let encryption = self.encryption.clone();
         self.pin_get_inner()
@@ -528,7 +812,7 @@ impl<E> Iterator for Subscriber<E>
 where
     E: Encryption,
 {
-    type Item = Event;
+    type Item = Result<Event>;
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
@@ -540,25 +824,54 @@ impl<E> Tree<E>
 where
     E: Encryption,
 {
+    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
+        self.encryption.decrypt_value_result(
+            self.inner.get(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+            ),
+        )
+    }
+
+    // needs to be performed in a transaction because the nonce needs to be updated
     pub fn insert<K, V>(&self, key: K, value: V) -> Result<Option<IVec>>
     where
         K: AsRef<[u8]>,
         V: Into<IVec>,
     {
-        self.encryption.decrypt_value_result(self.inner.insert(
-            self.encryption.encrypt_key(key.as_ref()),
-            self.encryption.encrypt_value(value),
-        ))
+        let value = value.into();
+        match self.transaction::<_, _, core::convert::Infallible>(|db| {
+            Ok(db.insert(&key, value.clone())?)
+        }) {
+            Ok(res) => Ok(res),
+            Err(transaction::TransactionError::Abort(_)) => {
+                unreachable!("there should be no abort possible in this transaction")
+            }
+            Err(transaction::TransactionError::Storage(err)) => Err(err),
+        }
     }
 
-    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
-        self.encryption
-            .decrypt_value_result(self.inner.get(self.encryption.encrypt_key(key.as_ref())))
-    }
-
+    // needs to be performed in a transaction because the nonce needs to be updated
     pub fn remove<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<IVec>> {
-        self.encryption
-            .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key(key.as_ref())))
+        match self.transaction::<_, _, core::convert::Infallible>(|db| Ok(db.remove(&key)?)) {
+            Ok(res) => Ok(res),
+            Err(transaction::TransactionError::Abort(_)) => {
+                unreachable!("there should be no abort possible in this transaction")
+            }
+            Err(transaction::TransactionError::Storage(err)) => Err(err),
+        }
+    }
+
+    // needs to be performed in a transaction because the nonces need to be updated
+    pub fn apply_batch(&self, batch: Batch) -> Result<()> {
+        match self.transaction::<_, _, core::convert::Infallible>(|db| Ok(db.apply_batch(&batch)?))
+        {
+            Ok(res) => Ok(res),
+            Err(transaction::TransactionError::Abort(_)) => {
+                unreachable!("there should be no abort possible in this transaction")
+            }
+            Err(transaction::TransactionError::Storage(err)) => Err(err),
+        }
     }
 
     pub fn transaction<F, A, Error>(&self, f: F) -> transaction::TransactionResult<A, Error>
@@ -575,16 +888,14 @@ where
         })
     }
 
-    pub fn watch_prefix<P: AsRef<[u8]>>(&self, prefix: P) -> Subscriber<E> {
-        Subscriber::new(
-            self.inner
-                .watch_prefix(self.encryption.encrypt_key(prefix.as_ref())),
+    pub fn watch_prefix<P: AsRef<[u8]>>(&self, prefix: P) -> Result<Subscriber<E>> {
+        Ok(Subscriber::new(
+            self.inner.watch_prefix(
+                self.encryption
+                    .encrypt_key(prefix.as_ref(), self.default_key_nonce_fn())?,
+            ),
             self.encryption.clone(),
-        )
-    }
-
-    pub fn apply_batch(&self, batch: Batch) -> Result<()> {
-        self.inner.apply_batch(self.encryption.encrypt_batch(batch))
+        ))
     }
 
     pub fn compare_and_swap<K, OV, NV>(
@@ -600,14 +911,23 @@ where
     {
         self.inner
             .compare_and_swap(
-                self.encryption.encrypt_key(key.as_ref()),
-                old.map(|val| self.encryption.encrypt_value(val.as_ref())),
-                new.map(|val| self.encryption.encrypt_value(val)),
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+                old.map(|val| self.encryption.encrypt_value(val.as_ref()))
+                    .transpose()?,
+                new.map(|val| self.encryption.encrypt_value(val))
+                    .transpose()?,
             )
             .map(|res| {
+                // TODO handle encrypt / decrypt errors more elegantly but for the most part this
+                // shouldn't happen because we should have verified old and new I believe...
                 res.map_err(|cas| CompareAndSwapError {
-                    current: cas.current.map(|v| self.encryption.decrypt_value(v)),
-                    proposed: cas.proposed.map(|v| self.encryption.decrypt_value(v)),
+                    current: cas
+                        .current
+                        .map(|v| self.encryption.decrypt_value(v).unwrap_or_default()),
+                    proposed: cas
+                        .proposed
+                        .map(|v| self.encryption.decrypt_value(v).unwrap_or_default()),
                 })
             })
     }
@@ -619,12 +939,19 @@ where
         V: Into<IVec>,
     {
         let new_f = move |old: Option<&[u8]>| {
-            f(old.map(|val| self.encryption.decrypt_value(val.as_ref())))
-                .map(|val| self.encryption.encrypt_value(val))
+            f(old.map(|val| {
+                self.encryption
+                    .decrypt_value(val.as_ref())
+                    .unwrap_or_default()
+            }))
+            .map(|val| self.encryption.encrypt_value(val).unwrap_or_default())
         };
         self.encryption.decrypt_value_result(
-            self.inner
-                .update_and_fetch(self.encryption.encrypt_key(key.as_ref()), new_f),
+            self.inner.update_and_fetch(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+                new_f,
+            ),
         )
     }
 
@@ -635,12 +962,19 @@ where
         V: Into<IVec>,
     {
         let new_f = move |old: Option<&[u8]>| {
-            f(old.map(|val| self.encryption.decrypt_value(val.as_ref())))
-                .map(|val| self.encryption.encrypt_value(val))
+            f(old.map(|val| {
+                self.encryption
+                    .decrypt_value(val.as_ref())
+                    .unwrap_or_default()
+            }))
+            .map(|val| self.encryption.encrypt_value(val).unwrap_or_default())
         };
         self.encryption.decrypt_value_result(
-            self.inner
-                .fetch_and_update(self.encryption.encrypt_key(key.as_ref()), new_f),
+            self.inner.fetch_and_update(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+                new_f,
+            ),
         )
     }
 
@@ -655,24 +989,34 @@ where
     }
 
     pub fn contains_key<K: AsRef<[u8]>>(&self, key: K) -> Result<bool> {
-        self.inner
-            .contains_key(self.encryption.encrypt_key(key.as_ref()))
+        self.inner.contains_key(
+            self.encryption
+                .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+        )
     }
 
     pub fn get_lt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
     where
         K: AsRef<[u8]>,
     {
-        self.encryption
-            .decrypt_key_value_result(self.inner.get_lt(self.encryption.encrypt_key(key.as_ref())))
+        self.encryption.decrypt_key_value_result(
+            self.inner.get_lt(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+            ),
+        )
     }
 
     pub fn get_gt<K>(&self, key: K) -> Result<Option<(IVec, IVec)>>
     where
         K: AsRef<[u8]>,
     {
-        self.encryption
-            .decrypt_key_value_result(self.inner.get_gt(self.encryption.encrypt_key(key.as_ref())))
+        self.encryption.decrypt_key_value_result(
+            self.inner.get_gt(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+            ),
+        )
     }
 
     pub fn first(&self) -> Result<Option<(IVec, IVec)>> {
@@ -694,58 +1038,72 @@ where
         Iter::new(self.inner.iter(), self.encryption.clone())
     }
 
-    pub fn range<K, R>(&self, range: R) -> Iter<E>
+    pub fn range<K, R>(&self, range: R) -> Result<Iter<E>>
     where
         K: AsRef<[u8]>,
         R: ops::RangeBounds<K>,
     {
-        let encrypt_bound = |bound: ops::Bound<&K>| -> ops::Bound<IVec> {
-            match bound {
+        let encrypt_bound = |bound: ops::Bound<&K>| -> Result<ops::Bound<IVec>> {
+            Ok(match bound {
                 ops::Bound::Unbounded => ops::Bound::Unbounded,
-                ops::Bound::Included(x) => {
-                    ops::Bound::Included(self.encryption.encrypt_key(x.as_ref()))
-                }
-                ops::Bound::Excluded(x) => {
-                    ops::Bound::Excluded(self.encryption.encrypt_key(x.as_ref()))
-                }
-            }
+                ops::Bound::Included(x) => ops::Bound::Included(
+                    self.encryption
+                        .encrypt_key(x.as_ref(), self.default_key_nonce_fn())?,
+                ),
+                ops::Bound::Excluded(x) => ops::Bound::Excluded(
+                    self.encryption
+                        .encrypt_key(x.as_ref(), self.default_key_nonce_fn())?,
+                ),
+            })
         };
         let range = (
-            encrypt_bound(range.start_bound()),
-            encrypt_bound(range.end_bound()),
+            encrypt_bound(range.start_bound())?,
+            encrypt_bound(range.end_bound())?,
         );
-        Iter::new(self.inner.range(range), self.encryption.clone())
+        Ok(Iter::new(self.inner.range(range), self.encryption.clone()))
     }
 
-    pub fn scan_prefix<P>(&self, prefix: P) -> Iter<E>
+    pub fn scan_prefix<P>(&self, prefix: P) -> Result<Iter<E>>
     where
         P: AsRef<[u8]>,
     {
-        Iter::new(
-            self.inner
-                .scan_prefix(self.encryption.encrypt_key(prefix.as_ref())),
+        Ok(Iter::new(
+            self.inner.scan_prefix(
+                self.encryption
+                    .encrypt_key(prefix.as_ref(), self.default_key_nonce_fn())?,
+            ),
             self.encryption.clone(),
-        )
+        ))
     }
 
-    #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.iter().count()
     }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
     #[inline]
     pub fn clear(&self) -> Result<()> {
         self.inner.clear()
     }
-    pub fn name(&self) -> IVec {
+
+    pub fn name(&self) -> Result<IVec> {
         self.encryption.decrypt_tree_name(self.inner.name())
     }
+
     #[inline]
     pub fn checksum(&self) -> Result<u32> {
         self.inner.checksum()
+    }
+
+    fn default_key_nonce_fn(&self) -> DefaultNonceFn<Error> {
+        Box::new(move |data| {
+            self.inner
+                .get(&key_nonce_key(self.encryption.salt_and_hash(data)))
+        })
     }
 }
 
@@ -758,26 +1116,33 @@ where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.encryption.decrypt_value_result(self.inner.merge(
-            self.encryption.encrypt_key(key.as_ref()),
-            self.encryption.encrypt_value(value.as_ref()),
-        ))
+        self.encryption.decrypt_value_result(
+            self.inner.merge(
+                self.encryption
+                    .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+                self.encryption.encrypt_value(value.as_ref())?,
+            ),
+        )
     }
 
     pub fn set_merge_operator(&self, merge_operator: impl sled::MergeOperator + 'static) {
         let encryption = self.encryption.clone();
         let new_operator = move |key: &[u8], old: Option<&[u8]>, merged: &[u8]| {
             merge_operator(
-                &encryption.decrypt_key(key.as_ref()),
-                old.map(|v| encryption.decrypt_value(v.as_ref())).as_deref(),
-                &encryption.decrypt_value(merged.as_ref()),
+                &encryption.decrypt_key(key.as_ref()).unwrap_or_default(),
+                old.map(|v| encryption.decrypt_value(v.as_ref()).unwrap_or_default())
+                    .as_deref(),
+                &encryption
+                    .decrypt_value(merged.as_ref())
+                    .unwrap_or_default(),
             )
-            .map(|v| encryption.encrypt_value(v).to_vec())
+            .map(|v| encryption.encrypt_value(v).unwrap_or_default().to_vec())
         };
         self.inner.set_merge_operator(new_operator);
     }
 }
 
+/// Fully serializable (ACID) multi-Tree transactions
 pub mod transaction {
     use super::*;
     pub use sled::transaction::{
@@ -785,6 +1150,7 @@ pub mod transaction {
         TransactionResult, UnabortableTransactionError,
     };
 
+    /// A transaction that will be applied atomically to the Tree.
     pub struct TransactionalTree<E> {
         inner: sled::transaction::TransactionalTree,
         encryption: Arc<E>,
@@ -797,6 +1163,21 @@ pub mod transaction {
         pub(crate) fn new(inner: sled::transaction::TransactionalTree, encryption: Arc<E>) -> Self {
             Self { inner, encryption }
         }
+
+        /// Get the value associated with a key
+        pub fn get<K: AsRef<[u8]>>(
+            &self,
+            key: K,
+        ) -> Result<Option<IVec>, UnabortableTransactionError> {
+            self.encryption.decrypt_value_result(
+                self.inner.get(
+                    self.encryption
+                        .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?,
+                ),
+            )
+        }
+
+        /// Set a key to a new value
         pub fn insert<K, V>(
             &self,
             key: K,
@@ -806,45 +1187,90 @@ pub mod transaction {
             K: AsRef<[u8]>,
             V: Into<IVec>,
         {
-            self.encryption.decrypt_value_result(self.inner.insert(
-                self.encryption.encrypt_key(key.as_ref()),
-                self.encryption.encrypt_value(value),
-            ))
+            let encrypted_key_name = self
+                .encryption
+                .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?;
+            let res = self.encryption.decrypt_value_result(
+                self.inner
+                    .insert(&encrypted_key_name, self.encryption.encrypt_value(value)?),
+            )?;
+            if self.encryption.applies_to_key() {
+                let nonce = self
+                    .encryption
+                    .get_nonce_from_encrypted(&encrypted_key_name)?;
+                self.inner.insert(
+                    key_nonce_key(self.encryption.salt_and_hash(key)).as_slice(),
+                    nonce,
+                )?;
+            }
+            Ok(res)
         }
 
-        pub fn get<K: AsRef<[u8]>>(
-            &self,
-            key: K,
-        ) -> Result<Option<IVec>, UnabortableTransactionError> {
-            self.encryption
-                .decrypt_value_result(self.inner.get(self.encryption.encrypt_key(key.as_ref())))
-        }
-
+        /// Remove a key
         pub fn remove<K: AsRef<[u8]>>(
             &self,
             key: K,
         ) -> Result<Option<IVec>, UnabortableTransactionError> {
-            self.encryption
-                .decrypt_value_result(self.inner.remove(self.encryption.encrypt_key(key.as_ref())))
+            let encrypted_key_name = self
+                .encryption
+                .encrypt_key(key.as_ref(), self.default_key_nonce_fn())?;
+            let res = self
+                .encryption
+                .decrypt_value_result(self.inner.remove(encrypted_key_name))?;
+            if self.encryption.applies_to_key() {
+                self.inner
+                    .remove(key_nonce_key(self.encryption.salt_and_hash(key)).as_slice())?;
+            }
+            Ok(res)
         }
 
+        /// Atomically apply multiple inserts and removals.
         pub fn apply_batch(&self, batch: &Batch) -> Result<(), UnabortableTransactionError> {
-            self.inner
-                .apply_batch(&self.encryption.encrypt_batch(batch.clone()))
+            for event in batch.events.iter() {
+                match event {
+                    Event::Insert { key, value } => {
+                        self.insert(key, value)?;
+                    }
+                    Event::Remove { key } => {
+                        self.remove(key)?;
+                    }
+                }
+            }
+            Ok(())
         }
 
+        /// Flush the database before returning from the transaction.
         #[inline]
         pub fn flush(&self) {
             self.inner.flush()
         }
 
+        /// Generate a monotonic ID. Not guaranteed to be contiguous or idempotent,
+        /// can produce different values in the same transaction in case of conflicts.
+        /// Written to disk every idgen_persist_interval operations, followed by a blocking
+        /// flush. During recovery, we take the last recovered generated ID and add 2x the
+        /// idgen_persist_interval to it. While persisting, if the previous persisted counter
+        /// wasn’t synced to disk yet, we will do a blocking flush to fsync the latest counter,
+        /// ensuring that we will never give out the same counter twice.
         #[inline]
         pub fn generate_id(&self) -> Result<u64> {
             self.inner.generate_id()
         }
+
+        fn default_key_nonce_fn(&self) -> DefaultNonceFn<UnabortableTransactionError> {
+            Box::new(move |data| {
+                self.inner
+                    .get(&key_nonce_key(self.encryption.salt_and_hash(data)))
+            })
+        }
     }
 }
 
+/// Opens a Db with a default configuration at the specified path. This will create a new
+/// storage directory at the specified path if it does not already exist. You can use the
+/// Db::was_recovered method to determine if your database was recovered from a previous
+/// instance. You can use Config::create_new if you want to increase the chances that the
+/// database will be freshly created.
 pub fn open<P: AsRef<Path>, E: Encryption>(path: P, encryption: E) -> Result<Db<E>> {
     sled::open(path).map(|db| Db::new(db, Arc::new(encryption)))
 }
@@ -852,16 +1278,21 @@ pub fn open<P: AsRef<Path>, E: Encryption>(path: P, encryption: E) -> Result<Db<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20::ChaCha20;
+    use chacha20poly1305::ChaCha20Poly1305;
 
-    type TestCipher = EncryptionCipher<ChaCha20>;
+    type TestCipher = EncryptionCipher<ChaCha20Poly1305, CountingNonce<ChaCha20Poly1305>>;
     type TestDb = Db<TestCipher>;
 
     const ENCRYPTION_KEY: &[u8] = b"an example very very secret key.";
-    const ENCRYPTION_NONCE: &[u8] = b"secret nonce";
 
     fn test_cipher(mode: EncryptionMode) -> TestCipher {
-        EncryptionCipher::new_from_slices(ENCRYPTION_KEY, ENCRYPTION_NONCE, mode).unwrap()
+        let mut key = Key::<ChaCha20Poly1305>::default();
+        key.copy_from_slice(&ENCRYPTION_KEY);
+        EncryptionCipher::new(
+            key,
+            CountingNonce::new(Nonce::<ChaCha20Poly1305>::default()),
+            mode,
+        )
     }
 
     fn temp_db(mode: EncryptionMode) -> TestDb {
@@ -885,6 +1316,21 @@ mod tests {
             EncryptionMode::KEY | EncryptionMode::TREE_NAME,
             EncryptionMode::VALUE | EncryptionMode::TREE_NAME,
             EncryptionMode::KEY | EncryptionMode::VALUE | EncryptionMode::TREE_NAME,
+        ] {
+            f(temp_db(*mode))?
+        }
+        Ok(())
+    }
+
+    fn for_cleartext_key_dbs<F>(f: F) -> Result<()>
+    where
+        F: Fn(TestDb) -> Result<()>,
+    {
+        for mode in &[
+            EncryptionMode::empty(),
+            EncryptionMode::VALUE,
+            EncryptionMode::TREE_NAME,
+            EncryptionMode::VALUE | EncryptionMode::TREE_NAME,
         ] {
             f(temp_db(*mode))?
         }
@@ -930,7 +1376,7 @@ mod tests {
 
     #[test]
     fn update_and_fetch() -> Result<()> {
-        for_all_dbs(|db| {
+        for_cleartext_key_dbs(|db| {
             let zero = u64_to_ivec(0);
             let one = u64_to_ivec(1);
             let two = u64_to_ivec(2);
@@ -946,7 +1392,7 @@ mod tests {
 
     #[test]
     fn fetch_and_update() -> Result<()> {
-        for_all_dbs(|db| {
+        for_cleartext_key_dbs(|db| {
             let zero = u64_to_ivec(0);
             let one = u64_to_ivec(1);
             let two = u64_to_ivec(2);
@@ -974,7 +1420,7 @@ mod tests {
             Some(ret)
         }
 
-        for_all_dbs(|tree| {
+        for_cleartext_key_dbs(|tree| {
             tree.set_merge_operator(concatenate_merge);
 
             let k = b"k1";
@@ -1061,12 +1507,12 @@ mod tests {
     #[test]
     fn subscribe() -> Result<()> {
         for_all_dbs(|db| {
-            let subscriber = db.watch_prefix(vec![]);
+            let subscriber = db.watch_prefix(vec![])?;
 
             let _ = std::thread::spawn(move || db.insert(vec![0], vec![1]));
 
             for event in subscriber.take(1) {
-                match event {
+                match event? {
                     sled::Event::Insert { key, .. } => assert_eq!(key.as_ref(), &[0]),
                     sled::Event::Remove { .. } => {}
                 }
